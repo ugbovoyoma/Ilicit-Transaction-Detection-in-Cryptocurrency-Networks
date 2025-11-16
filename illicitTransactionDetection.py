@@ -2029,6 +2029,7 @@ num_batches = (num_train_samples + batch_size - 1) // batch_size
 print(f"Batches per epoch: {num_batches}")
 with torch.no_grad():
     test_batch = X_train_tensor[:10]
+    test_batch = test_batch.to(lstm_model.fc1.weight.device)
     test_out = lstm_model(test_batch)
     print(f"Sanity check passed - Model forward pass OK\n")
 
@@ -2052,7 +2053,9 @@ for epoch in range(num_epochs):
 
         # Forward pass
         optimizer.zero_grad()
+        batch_X = batch_X.to(lstm_model.fc1.weight.device)
         outputs = lstm_model(batch_X)
+        batch_y = batch_y.to(outputs.device)
         loss = criterion(outputs, batch_y)
 
         # Backward pass
@@ -2083,7 +2086,9 @@ for epoch in range(num_epochs):
             batch_X = X_test_tensor[start_idx:end_idx]
             batch_y = y_test_tensor[start_idx:end_idx]
 
+            batch_X = batch_X.to(lstm_model.fc1.weight.device)
             outputs = lstm_model(batch_X)
+            batch_y = batch_y.to(outputs.device)
             loss = criterion(outputs, batch_y)
             val_loss += loss.item()
 
@@ -2095,6 +2100,7 @@ for epoch in range(num_epochs):
     # Calculate validation AUC-PR for better monitoring (imbalanced data)
     lstm_model.eval()
     with torch.no_grad():
+        X_test_tensor = X_test_tensor.to(lstm_model.fc1.weight.device)
         val_outputs = lstm_model(X_test_tensor)
         val_probs = F.softmax(val_outputs, dim=1)[:, 1].cpu().numpy()
         val_auc_pr = average_precision_score(y_test_tensor.cpu().numpy(), val_probs)
@@ -2835,7 +2841,8 @@ class HybridFraudDetector(nn.Module):
         """Extract LSTM embeddings."""
         self.lstm.eval()
         with torch.no_grad():
-            x = x_temporal.unsqueeze(1)  # (batch, 1, features)
+            # Move x_temporal to the same device as LSTM parameters
+            x = x_temporal.to(self.lstm.lstm.weight_ih_l0.device).unsqueeze(1)  # (batch, 1, features)
             lstm_out, (hidden, cell) = self.lstm.lstm(x)
             last_hidden = hidden[-1]  # (batch, hidden_dim)
         return last_hidden
@@ -3029,6 +3036,7 @@ for epoch in range(num_epochs):
             graph_data.edge_index,
             batch_node_indices
         )
+        batch_y = batch_y.to(outputs.device)
         loss = criterion(outputs, batch_y)
 
         # Backward pass
@@ -3066,6 +3074,7 @@ for epoch in range(num_epochs):
                 graph_data.edge_index,
                 batch_node_indices
             )
+            batch_y = batch_y.to(outputs.device)
             loss = criterion(outputs, batch_y)
             val_loss += loss.item()
 
