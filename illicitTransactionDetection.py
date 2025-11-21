@@ -33,6 +33,16 @@ import time
 
 
 # Import additional libraries for analysis and modeling
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from torch_geometric.data import Data
+from torch_geometric.nn import SAGEConv, GCNConv, GATConv, global_mean_pool
+import torch_geometric.transforms as T
+from tqdm import tqdm
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -44,6 +54,13 @@ from sklearn.metrics import classification_report, confusion_matrix, roc_auc_sco
 from imblearn.over_sampling import SMOTE
 import networkx as nx
 import warnings
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import (
+    classification_report, confusion_matrix, 
+    roc_auc_score, average_precision_score, matthews_corrcoef,
+    precision_recall_curve, roc_curve
+)
 warnings.filterwarnings('ignore')
 
 # Set plotting style
@@ -58,14 +75,23 @@ sns.set_palette("husl")
 # Note: Update these paths to match your dataset location
 DATA_DIR = './dataset/rawData/elliptic_bitcoin_dataset'
 
-elliptic_txs_classes= pd.read_csv(f'{DATA_DIR}/elliptic_txs_classes.csv')
+with tqdm(total=3, desc="Loading CSV files", unit="file") as pbar:
+    elliptic_txs_classes = pd.read_csv(f'{DATA_DIR}/elliptic_txs_classes.csv')
+    pbar.update(1)
+    
+    elliptic_txs_edgelist = pd.read_csv(f'{DATA_DIR}/elliptic_txs_edgelist.csv')
+    pbar.update(1)
+    
+    elliptic_txs_features = pd.read_csv(f'{DATA_DIR}/elliptic_txs_features.csv')
+    pbar.update(1)
 
-elliptic_txs_edgelist= pd.read_csv(f'{DATA_DIR}/elliptic_txs_edgelist.csv')
+print(f"\n✓ Datasets loaded successfully")
+print(f"  - Classes: {len(elliptic_txs_classes):,}")
+print(f"  - Edgelist: {len(elliptic_txs_edgelist):,}")
+print(f"  - Features: {len(elliptic_txs_features):,}")
 
-elliptic_txs_features= pd.read_csv(f'{DATA_DIR}/elliptic_txs_features.csv')
-
-
-# In[ ]:
+# Label mapping used across models
+label_map = {'2': 0, '1': 1}
 
 
 #Rename classes columns for clarity
@@ -290,33 +316,21 @@ else:
 print("TRAIN/TEST SPLIT STRATEGY ANALYSIS")
 print("=" * 50)
 
-# Option 1: Random split analysis
-print("Option 1: Random Split (ignoring temporal structure)")
-
-# Use only the feature columns that exist in labeled_data
+# ENFORCE TEMPORAL SPLIT ONLY
 feature_columns = [col for col in labeled_data.columns if col.startswith('feature_')]
-X_temp = labeled_data[feature_columns]
-y_temp = labeled_data['class_label']
+early_periods = labeled_data[labeled_data['time_step'] <= 35]  # Train: first 35 time steps
+late_periods = labeled_data[labeled_data['time_step'] > 35]    # Test: time steps 36-49
 
-X_train_rand, X_test_rand, y_train_rand, y_test_rand = train_test_split(
-    X_temp, y_temp, test_size=0.2, random_state=42, stratify=y_temp
-)
+X_train = early_periods[feature_columns]
+y_train = early_periods['class_label']
+X_test = late_periods[feature_columns]
+y_test = late_periods['class_label']
 
-print(f"Random split - Train: {len(X_train_rand):,}, Test: {len(X_test_rand):,}")
-print(f"Train class distribution: {y_train_rand.value_counts().to_dict()}")
-print(f"Test class distribution: {y_test_rand.value_counts().to_dict()}")
-
-# Option 2: Temporal split analysis  
-print(f"\nOption 2: Temporal Split (respecting time structure)")
-early_periods = labeled_data[labeled_data['time_step'] <= 35]  # First ~70% of time periods
-late_periods = labeled_data[labeled_data['time_step'] > 35]    # Last ~30% of time periods
-
-print(f"Temporal split - Train (≤35): {len(early_periods):,}, Test (>35): {len(late_periods):,}")
-print(f"Train class distribution: {early_periods['class_label'].value_counts().to_dict()}")
-print(f"Test class distribution: {late_periods['class_label'].value_counts().to_dict()}")
-
-print(f"\nTrain period illicit rate: {(early_periods['class_label'] == '1').sum() / len(early_periods) * 100:.1f}%")
-print(f"Test period illicit rate: {(late_periods['class_label'] == '1').sum() / len(late_periods) * 100:.1f}%")
+print(f"Temporal split - Train (≤35): {len(X_train):,}, Test (>35): {len(X_test):,}")
+print(f"Train class distribution: {y_train.value_counts().to_dict()}")
+print(f"Test class distribution: {y_test.value_counts().to_dict()}")
+print(f"\nTrain period illicit rate: {(y_train == '1').sum() / len(y_train) * 100:.1f}%")
+print(f"Test period illicit rate: {(y_test == '1').sum() / len(y_test) * 100:.1f}%")
 
 
 # In[ ]:
@@ -362,9 +376,10 @@ print(f"Training data illicit rate: {(y_train_temp == '1').sum() / len(y_train_t
 initial_model = RandomForestClassifier(n_estimators=100, class_weight='balanced', random_state=42)
 initial_model.fit(X_train_temp, y_train_temp)
 
-# Step 2: Generate pseudo-labels for ALL unlabeled data
-X_unlabeled = unlabeled_data[feature_cols]
-print(f"\nStep 2: Generating pseudo-labels for {len(X_unlabeled):,} unlabeled transactions...")
+# Step 2: Generate pseudo-labels only from training-period unlabeled data (time_step ≤ 35)
+unlabeled_train = unlabeled_data[unlabeled_data['time_step'] <= 35]
+X_unlabeled = unlabeled_train[feature_cols]
+print(f"\nStep 2: Generating pseudo-labels for {len(X_unlabeled):,} unlabeled training-period transactions...")
 
 pseudo_probs = initial_model.predict_proba(X_unlabeled)
 pseudo_labels = initial_model.predict(X_unlabeled)
@@ -481,136 +496,92 @@ print(f"+ Pseudo-labeling: {len(X_enhanced):,} (ratio {new_ratio:.1f}:1)")
 print(f"+ SMOTE: {len(X_final):,} (ratio {final_ratio:.1f}:1)")
 
 
-# **ADVANCED FEATURE ENGINEERING**
+# ADVANCED FEATURE ENGINEERING
 
-# In[ ]:
+# Define feature groups early to avoid NameError later and to align with engineered columns
+temporal_features = [
+    'time_step_normalized', 'time_period_early', 'time_period_mid', 'time_period_late',
+    'in_fraud_campaign', 'rolling_tx_count_3', 'time_since_last_tx', 'tx_velocity',
+    'in_burst_period', 'is_rapid_tx', 'tx_recurrence', 'avg_time_appearance',
+    'is_early_adopter', 'is_late_entrant'
+]
+
+graph_features = [
+    'in_degree', 'out_degree', 'total_degree', 'pagerank',
+    'clustering_coef', 'betweenness', 'neighbor_avg_degree', 'degree_ratio'
+]
 
 
 # TEMPORAL FEATURE ENGINEERING
+
+
 print("TEMPORAL FEATURE ENGINEERING")
-print("=" * 60)
 
-# Create temporal features from time_step
-print("Creating temporal features...")
+with tqdm(total=4, desc="Creating temporal features", unit="feature_group") as pbar:
+    # Basic temporal features
+    data['time_step_normalized'] = (data['time_step'] - data['time_step'].min()) / \
+                                   (data['time_step'].max() - data['time_step'].min())
+    data['time_period_early'] = (data['time_step'] <= 16).astype(int)
+    data['time_period_mid'] = ((data['time_step'] > 16) & (data['time_step'] <= 33)).astype(int)
+    data['time_period_late'] = (data['time_step'] > 33).astype(int)
+    fraud_campaign_periods = [9, 13, 15, 16, 20]
+    data['in_fraud_campaign'] = data['time_step'].isin(fraud_campaign_periods).astype(int)
+    pbar.update(1)
 
-# 1. BASIC TEMPORAL FEATURES
-# Add time-based features to the main dataset
-data['time_step_normalized'] = (data['time_step'] - data['time_step'].min()) / (data['time_step'].max() - data['time_step'].min())
-data['time_period_early'] = (data['time_step'] <= 16).astype(int)  # First third
-data['time_period_mid'] = ((data['time_step'] > 16) & (data['time_step'] <= 33)).astype(int)  # Middle third
-data['time_period_late'] = (data['time_step'] > 33).astype(int)  # Last third
-
-# Create fraud campaign indicators (from earlier analysis)
-fraud_campaign_periods = [9, 13, 15, 16, 20]
-data['in_fraud_campaign'] = data['time_step'].isin(fraud_campaign_periods).astype(int)
-
-# 2. ROLLING WINDOW STATISTICS (Transaction frequency over time)
-print("Calculating rolling window features...")
-start_time = time.time()
-
-# Sort by time_step for proper rolling calculations
-data_sorted = data.sort_values('time_step')
-
-# Group by node_ID and calculate rolling statistics
-rolling_features = []
-for node_id, group in data_sorted.groupby('node_ID'):
-    group = group.sort_values('time_step')
-    
-    # Rolling transaction count (window=3)
-    rolling_count_3 = group['time_step'].rolling(window=3, min_periods=1).count()
-    
-    # Time since last occurrence (for nodes that appear multiple times)
-    if len(group) > 1:
+    # Rolling window features
+    print("\n  Computing rolling window features...")
+    data_sorted = data.sort_values('time_step')
+    rolling_features = []
+    for node_id, group in tqdm(data_sorted.groupby('node_ID'), desc="  Rolling windows", leave=False):
+        group = group.sort_values('time_step')
+        rolling_count_3 = group['time_step'].rolling(window=3, min_periods=1).count()
         time_diff = group['time_step'].diff().fillna(0)
-    else:
-        time_diff = pd.Series([0] * len(group), index=group.index)
-    
-    # Transaction velocity (appearances per time window)
-    if len(group) > 1:
         time_span = group['time_step'].max() - group['time_step'].min()
-        velocity = len(group) / (time_span + 1)  # +1 to avoid division by zero
-    else:
-        velocity = 0
+        velocity = len(group) / (time_span + 1)
+        
+        temp_df = pd.DataFrame({
+            'node_ID': node_id,
+            'time_step': group['time_step'],
+            'rolling_tx_count_3': rolling_count_3.values,
+            'time_since_last_tx': time_diff.values,
+            'tx_velocity': velocity
+        }, index=group.index)
+        rolling_features.append(temp_df)
     
-    temp_df = pd.DataFrame({
-        'node_ID': node_id,
-        'time_step': group['time_step'],
-        'rolling_tx_count_3': rolling_count_3.values,
-        'time_since_last_tx': time_diff.values,
-        'tx_velocity': velocity
-    }, index=group.index)
-    
-    rolling_features.append(temp_df)
+    rolling_df = pd.concat(rolling_features, ignore_index=False)
+    data = data.merge(rolling_df[['node_ID', 'time_step', 'rolling_tx_count_3', 
+                                   'time_since_last_tx', 'tx_velocity']],
+                     on=['node_ID', 'time_step'], how='left')
+    data['rolling_tx_count_3'] = data['rolling_tx_count_3'].fillna(1)
+    data['time_since_last_tx'] = data['time_since_last_tx'].fillna(0)
+    data['tx_velocity'] = data['tx_velocity'].fillna(0)
+    pbar.update(1)
 
-rolling_df = pd.concat(rolling_features, ignore_index=False)
+    # Burst detection
+    print("\n  Detecting burst activity...")
+    tx_freq_per_timestep = data.groupby('time_step').size()
+    overall_mean_freq = tx_freq_per_timestep.mean()
+    overall_std_freq = tx_freq_per_timestep.std()
+    burst_threshold = overall_mean_freq + 2 * overall_std_freq
+    burst_timesteps = tx_freq_per_timestep[tx_freq_per_timestep > burst_threshold].index.tolist()
+    data['in_burst_period'] = data['time_step'].isin(burst_timesteps).astype(int)
+    data['is_rapid_tx'] = ((data['time_since_last_tx'] > 0) & (data['time_since_last_tx'] <= 2)).astype(int)
+    pbar.update(1)
 
-# Merge back to main data
-data = data.merge(
-    rolling_df[['node_ID', 'time_step', 'rolling_tx_count_3', 'time_since_last_tx', 'tx_velocity']],
-    on=['node_ID', 'time_step'],
-    how='left'
-)
+    # Temporal aggregates
+    print("\n  Computing temporal aggregates...")
+    early_threshold = data['time_step'].quantile(0.33)
+    late_threshold = data['time_step'].quantile(0.67)
+    data['is_early_adopter'] = (data['time_step'] <= early_threshold).astype(int)
+    data['is_late_entrant'] = (data['time_step'] >= late_threshold).astype(int)
+    tx_recurrence = data.groupby('node_ID').size().to_dict()
+    data['tx_recurrence'] = data['node_ID'].map(tx_recurrence)
+    avg_timestep = data.groupby('node_ID')['time_step'].mean().to_dict()
+    data['avg_time_appearance'] = data['node_ID'].map(avg_timestep)
+    pbar.update(1)
 
-# Fill NaN values
-data['rolling_tx_count_3'] = data['rolling_tx_count_3'].fillna(1)
-data['time_since_last_tx'] = data['time_since_last_tx'].fillna(0)
-data['tx_velocity'] = data['tx_velocity'].fillna(0)
-
-print(f"Rolling window features calculated ({time.time() - start_time:.2f}s)")
-
-# 3. BURST DETECTION (Sudden increase in activity)
-print("Detecting burst activity patterns...")
-start_time = time.time()
-
-# Calculate transaction frequency per time_step
-tx_freq_per_timestep = data.groupby('time_step').size()
-overall_mean_freq = tx_freq_per_timestep.mean()
-overall_std_freq = tx_freq_per_timestep.std()
-
-# Mark burst periods (activity > mean + 2*std)
-burst_threshold = overall_mean_freq + 2 * overall_std_freq
-burst_timesteps = tx_freq_per_timestep[tx_freq_per_timestep > burst_threshold].index.tolist()
-data['in_burst_period'] = data['time_step'].isin(burst_timesteps).astype(int)
-
-# Node-level burst detection (rapid succession of transactions)
-data['is_rapid_tx'] = (data['time_since_last_tx'] > 0) & (data['time_since_last_tx'] <= 2)
-data['is_rapid_tx'] = data['is_rapid_tx'].astype(int)
-
-print(f"Burst detection completed ({time.time() - start_time:.2f}s)")
-print(f"  Identified {len(burst_timesteps)} burst periods: {burst_timesteps}")
-print(f"  Rapid transactions: {data['is_rapid_tx'].sum():,} ({data['is_rapid_tx'].mean()*100:.2f}%)")
-
-# 4. TEMPORAL AGGREGATES (Average behavior over time windows)
-print("Calculating temporal aggregates...")
-start_time = time.time()
-
-# Early vs late period comparison
-early_threshold = data['time_step'].quantile(0.33)
-late_threshold = data['time_step'].quantile(0.67)
-
-data['is_early_adopter'] = (data['time_step'] <= early_threshold).astype(int)
-data['is_late_entrant'] = (data['time_step'] >= late_threshold).astype(int)
-
-# Transaction recurrence (how many times node appears)
-tx_recurrence = data.groupby('node_ID').size().to_dict()
-data['tx_recurrence'] = data['node_ID'].map(tx_recurrence)
-
-# Average time_step for each node (temporal centrality)
-avg_timestep = data.groupby('node_ID')['time_step'].mean().to_dict()
-data['avg_time_appearance'] = data['node_ID'].map(avg_timestep)
-
-print(f"Temporal aggregates calculated ({time.time() - start_time:.2f}s)")
-
-print(f"\nTemporal features created:")
-print(f"- time_step_normalized: normalized time position")
-print(f"- time_period indicators: early/mid/late")
-print(f"- rolling_tx_count_3: 3-period rolling transaction count")
-print(f"- time_since_last_tx: time gap between consecutive transactions")
-print(f"- tx_velocity: transaction frequency rate")
-print(f"- in_burst_period: whether in high-activity period")
-print(f"- is_rapid_tx: rapid succession flag")
-print(f"- tx_recurrence: total appearances of node")
-print(f"- avg_time_appearance: average temporal position")
+print("\n✓ Temporal feature engineering complete")
+print(f"  - {len(temporal_features)} temporal features expected (columns now materialized)")
 
 # Analyze temporal features by class
 print(f"\nTemporal features by transaction class:")
@@ -632,113 +603,68 @@ for class_label in ['1', '2']:
 
 
 # GRAPH-BASED FEATURE ENGINEERING
-print("GRAPH-BASED FEATURE ENGINEERING")
-print("=" * 60)
 
-# Build transaction network graph
-print("Building directed transaction graph G = (N, E)...")
-import time
-start_time = time.time()
+print("GRAPH FEATURE ENGINEERING")
 
-# Create NetworkX directed graph from edgelist
-G = nx.from_pandas_edgelist(
-    elliptic_txs_edgelist, 
-    source='txId1', 
-    target='txId2', 
-    create_using=nx.DiGraph()
-)
 
-print(f"Graph constructed in {time.time() - start_time:.2f}s")
-print(f"  Nodes (transactions): {G.number_of_nodes():,}")
-print(f"  Edges (Bitcoin flows): {G.number_of_edges():,}")
-print(f"  Network density: {nx.density(G):.6f}")
+with tqdm(total=6, desc="Computing graph features", unit="feature") as pbar:
+    # Build graph using ONLY training-period edges (time_step ≤ 35) to avoid future leakage
+    print("\n  Building transaction network (train-period edges only)...")
+    node_time_map = data.set_index('node_ID')['time_step'].to_dict()
+    train_nodes_set = {n for n, t in node_time_map.items() if t <= 35}
+    edge_mask = (
+        elliptic_txs_edgelist['txId1'].isin(train_nodes_set) &
+        elliptic_txs_edgelist['txId2'].isin(train_nodes_set)
+    )
+    filtered_edges = elliptic_txs_edgelist[edge_mask]
+    G = nx.from_pandas_edgelist(filtered_edges, source='txId1', 
+                                target='txId2', create_using=nx.DiGraph())
+    pbar.update(1)
 
-# Calculate graph-based features
-print("\nCalculating structural features for all transactions...")
-start_time = time.time()
+    # Degree centrality
+    print("  Computing degree centrality...")
+    in_degree_dict = dict(G.in_degree())
+    out_degree_dict = dict(G.out_degree())
+    data['in_degree'] = data['node_ID'].map(in_degree_dict).fillna(0)
+    data['out_degree'] = data['node_ID'].map(out_degree_dict).fillna(0)
+    data['total_degree'] = data['in_degree'] + data['out_degree']
+    pbar.update(1)
 
-# 1. DEGREE CENTRALITY measures
-in_degree_dict = dict(G.in_degree())
-out_degree_dict = dict(G.out_degree())
 
-# Map to dataframe
-data['in_degree'] = data['node_ID'].map(in_degree_dict).fillna(0)
-data['out_degree'] = data['node_ID'].map(out_degree_dict).fillna(0)
-data['total_degree'] = data['in_degree'] + data['out_degree']
+    # PageRank (limit iterations for scalability)
+    print("  Computing scalable PageRank...")
+    pagerank_dict = nx.pagerank(G, max_iter=20, alpha=0.85)
+    data['pagerank'] = data['node_ID'].map(pagerank_dict).fillna(0)
+    pbar.update(1)
 
-print(f"Degree centrality calculated ({time.time() - start_time:.2f}s)")
+    # Clustering coefficient (unchanged, fast for sparse graphs)
+    print("  Computing clustering coefficient...")
+    G_undirected = G.to_undirected()
+    clustering_dict = nx.clustering(G_undirected)
+    data['clustering_coef'] = data['node_ID'].map(clustering_dict).fillna(0)
+    pbar.update(1)
 
-# 2. PAGERANK (measures transaction importance in network)
-print("Calculating PageRank scores...")
-start_time = time.time()
-pagerank_dict = nx.pagerank(G, max_iter=50, alpha=0.85)
-data['pagerank'] = data['node_ID'].map(pagerank_dict).fillna(0)
-print(f"PageRank calculated ({time.time() - start_time:.2f}s)")
+    # Betweenness centrality (approximate, scalable)
+    print("  Computing betweenness centrality (approximation)...")
+    k_sample = min(500, G.number_of_nodes())
+    betweenness_dict = nx.betweenness_centrality(G, k=k_sample, normalized=True)
+    data['betweenness'] = data['node_ID'].map(betweenness_dict).fillna(0)
+    pbar.update(1)
 
-# 3. CLUSTERING COEFFICIENT (measures local network density)
-print("Calculating clustering coefficients...")
-start_time = time.time()
-# Use undirected version for clustering coefficient
-G_undirected = G.to_undirected()
-clustering_dict = nx.clustering(G_undirected)
-data['clustering_coef'] = data['node_ID'].map(clustering_dict).fillna(0)
-print(f"Clustering coefficient calculated ({time.time() - start_time:.2f}s)")
+    # Additional features
+    print("  Computing neighbor average degree...")
+    neighbor_avg_degree = {}
+    for node in tqdm(G.nodes(), desc="  Neighbor degrees", leave=False):
+        neighbors = list(G.neighbors(node))
+        neighbor_avg_degree[node] = np.mean([G.degree(n) for n in neighbors]) if neighbors else 0
+    data['neighbor_avg_degree'] = data['node_ID'].map(neighbor_avg_degree).fillna(0)
+    data['degree_ratio'] = np.where(data['out_degree'] > 0, 
+                                    data['in_degree'] / data['out_degree'], 
+                                    data['in_degree'])
+    pbar.update(1)
 
-# 4. BETWEENNESS CENTRALITY (measures node's role as bridge)
-# NOTE: This is computationally expensive, so we'll sample or use approximation
-print("Calculating betweenness centrality (approximation for speed)...")
-start_time = time.time()
-# Use k parameter to sample subset of nodes for faster computation
-k_sample = min(1000, G.number_of_nodes())
-betweenness_dict = nx.betweenness_centrality(G, k=k_sample, normalized=True)
-data['betweenness'] = data['node_ID'].map(betweenness_dict).fillna(0)
-print(f"Betweenness centrality calculated ({time.time() - start_time:.2f}s)")
-
-# 5. COMMUNITY DETECTION using Louvain algorithm
-print("Detecting communities using Louvain algorithm...")
-start_time = time.time()
-try:
-    import community as community_louvain
-    # Convert to undirected for community detection
-    communities = community_louvain.best_partition(G_undirected)
-    data['community_id'] = data['node_ID'].map(communities).fillna(-1).astype(int)
-    
-    # Calculate community size (useful feature)
-    community_sizes = pd.Series(communities).value_counts().to_dict()
-    data['community_size'] = data['community_id'].map(community_sizes).fillna(0)
-    
-    print(f"Community detection completed ({time.time() - start_time:.2f}s)")
-    print(f"  Number of communities detected: {data['community_id'].nunique()}")
-except ImportError:
-    print("Warning: python-louvain not installed. Skipping community detection.")
-    print("Install with: pip install python-louvain")
-    data['community_id'] = 0
-    data['community_size'] = 0
-
-# 6. ADDITIONAL GRAPH FEATURES
-print("Calculating additional graph features...")
-start_time = time.time()
-
-# Average degree of neighbors
-neighbor_avg_degree = {}
-for node in G.nodes():
-    neighbors = list(G.neighbors(node))
-    if neighbors:
-        avg_deg = np.mean([G.degree(n) for n in neighbors])
-        neighbor_avg_degree[node] = avg_deg
-    else:
-        neighbor_avg_degree[node] = 0
-
-data['neighbor_avg_degree'] = data['node_ID'].map(neighbor_avg_degree).fillna(0)
-
-# Degree ratio (in/out) - can indicate mixing behavior
-data['degree_ratio'] = np.where(
-    data['out_degree'] > 0,
-    data['in_degree'] / data['out_degree'],
-    data['in_degree']  # If out_degree is 0, just use in_degree
-)
-
-print(f"Additional graph features calculated ({time.time() - start_time:.2f}s)")
+print("\n✓ Graph feature engineering complete")
+print(f"  - {len(graph_features)} graph features created")
 
 # Analyze graph features by class
 print("\n" + "=" * 60)
@@ -774,20 +700,6 @@ print("=" * 60)
 # Define feature categories
 original_features = [f'feature_{i}' for i in range(1, 166)]
 
-# Graph features (for GNN and Hybrid)
-graph_features = [
-    'in_degree', 'out_degree', 'total_degree', 'pagerank',
-    'clustering_coef', 'betweenness_cent', 'community_id'
-]
-
-# Temporal features (for LSTM and Hybrid)
-temporal_features = [
-    'time_step_normalized', 'time_period_early', 'time_period_mid', 'time_period_late',
-    'in_fraud_campaign', 'rolling_tx_count_3', 'time_since_last_tx', 'tx_velocity',
-    'in_burst_period', 'is_rapid_tx', 'tx_recurrence', 'avg_time_appearance',
-    'is_early_adopter', 'is_late_entrant'
-]
-
 # Combined feature sets
 baseline_features = original_features  # Baseline ML models: original features only
 lstm_features = original_features + temporal_features  # LSTM: original + temporal
@@ -809,36 +721,8 @@ print(f"\nConverting SMOTE arrays to DataFrames...")
 X_train_modeling = pd.DataFrame(X_final, columns=original_features)
 y_train_modeling = pd.Series(y_final)
 
-# For SMOTE-generated samples, add mean values for engineered features (from training periods 1-35)
-print(f"Adding engineered features to SMOTE training data...")
-train_periods = data[data['time_step'].between(1, 35)]
 
-# Calculate mean values of engineered features from real training data
-for feature in graph_features:
-    if feature in train_periods.columns:
-        mean_val = train_periods[feature].mean()
-        X_train_modeling[feature] = mean_val
-    else:
-        X_train_modeling[feature] = 0
-        
-for feature in temporal_features:
-    if feature in train_periods.columns:
-        mean_val = train_periods[feature].mean()
-        X_train_modeling[feature] = mean_val
-    else:
-        X_train_modeling[feature] = 0
-
-# Verify no NaN values in training data
-train_nan_check = X_train_modeling.isnull().sum().sum()
-if train_nan_check > 0:
-    print(f"Warning: Found {train_nan_check} NaN values in training data, filling with column means...")
-    X_train_modeling = X_train_modeling.fillna(X_train_modeling.mean())
-
-print(f"Training data shape: {X_train_modeling.shape}")
-print(f"  Baseline features: {len(baseline_features)}")
-print(f"  LSTM features: {len(lstm_features)}")
-print(f"  GNN features: {len(gnn_features)}")
-print(f"  Hybrid features: {len(hybrid_features)}")
+# Note: GNN/Hybrid models will be trained on real labeled nodes only (defined later)
 
 # Prepare test data (periods 36-49) - use actual engineered features
 print(f"\nPreparing test data from periods 36-49...")
@@ -849,23 +733,13 @@ missing_graph = [f for f in graph_features if f not in test_data.columns]
 missing_temporal = [f for f in temporal_features if f not in test_data.columns]
 
 # If features are missing in the test set (common when graph computation sampling/ordering differs),
-# fill them using training-set column means when available, otherwise fill with zeros.
-if missing_graph:
-    print(f"Warning: Missing graph features in test data: {missing_graph}")
-if missing_temporal:
-    print(f"Warning: Missing temporal features in test data: {missing_temporal}")
 
-# Compute train means for safe filling (use X_train_modeling which contains engineered features)
+# Fill missing features in test set using only training statistics
 train_means = X_train_modeling.mean()
-
 for col in missing_graph + missing_temporal:
-    if col in X_train_modeling.columns:
-        fill_val = train_means.get(col, 0.0)
-        print(f"Filling missing column '{col}' in test data with training mean: {fill_val:.6f}")
-        test_data[col] = fill_val
-    else:
-        print(f"Filling missing column '{col}' in test data with 0.0 (no train mean available)")
-        test_data[col] = 0.0
+    fill_val = train_means.get(col, 0.0)
+    print(f"Filling missing column '{col}' in test data with training mean: {fill_val:.6f}")
+    test_data[col] = fill_val
 
 # Extract features based on model type (now safe because missing cols were filled)
 X_test_baseline = test_data[baseline_features]
@@ -904,47 +778,56 @@ print("\nFeature preparation completed")
 print("TRAINING BASELINE MODEL: LOGISTIC REGRESSION")
 print("=" * 60)
 
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    classification_report, confusion_matrix, 
-    roc_auc_score, average_precision_score, matthews_corrcoef,
-    precision_recall_curve, roc_curve
-)
+with tqdm(total=4, desc="Logistic Regression", unit="step", colour="blue") as pbar:
+    # Step 1: Scale features (critical for LR)
+    # Important: Use only baseline features for baseline models to ensure consistency
+    print("  Step 1: Scaling features...")
+    print(f"  Using {len(baseline_features)} baseline features for Logistic Regression")
 
-# Scale features (critical for LR)
-# Important: Use only baseline features for baseline models to ensure consistency
-print("Scaling features...")
-print(f"Using {len(baseline_features)} baseline features for Logistic Regression")
+    # Extract baseline features from training data
+    X_train_baseline = X_train_modeling[baseline_features]
 
-# Extract baseline features from training data
-X_train_baseline = X_train_modeling[baseline_features]
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_baseline)
+    X_test_scaled = scaler.transform(X_test_modeling)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Features scaled"})
 
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train_baseline)
-X_test_scaled = scaler.transform(X_test_modeling)
+    # Step 2: Train Logistic Regression (with class weights for imbalance)
+    print("  Step 2: Training Logistic Regression...")
+    lr_model = LogisticRegression(
+        class_weight='balanced',  # Handle class imbalance
+        max_iter=1000,
+        random_state=42,
+        n_jobs=-1
+    )
+    lr_model.fit(X_train_scaled, y_train_modeling)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Model trained"})
 
-# Train Logistic Regression (with class weights for imbalance)
-print("Training Logistic Regression...")
-lr_model = LogisticRegression(
-    class_weight='balanced',  # Handle class imbalance
-    max_iter=1000,
-    random_state=42,
-    n_jobs=-1
-)
-lr_model.fit(X_train_scaled, y_train_modeling)
+    # Step 3: Generate predictions
+    print("  Step 3: Generating predictions...")
+    y_pred_lr = lr_model.predict(X_test_scaled)
+    y_proba_lr = lr_model.predict_proba(X_test_scaled)[:, 1]
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Predictions generated"})
 
-# Predictions
-y_pred_lr = lr_model.predict(X_test_scaled)
-y_proba_lr = lr_model.predict_proba(X_test_scaled)[:, 1]
+    # Step 4: Evaluate on labeled test set
+    print("  Step 4: Evaluating model...")
+    # Evaluation (per Section 3.7) - Filter out unknown labels for evaluation
+    labeled_test_mask = y_test_modeling.isin(['1', '2'])
+    y_test_labeled = y_test_modeling[labeled_test_mask]
+    y_pred_labeled = y_pred_lr[labeled_test_mask]
+    y_proba_labeled = y_proba_lr[labeled_test_mask]
+    
+    # Convert to numeric for metrics
+    y_test_labeled_numeric = y_test_labeled.map({'1': 1, '2': 0})
+    y_pred_lr_numeric = (y_pred_labeled == '1').astype(int)
+    
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Model evaluated"})
 
-# Evaluation (per Section 3.7) - Filter out unknown labels for evaluation
-print("\nFiltering test set to labeled transactions only...")
-labeled_test_mask = y_test_modeling.isin(['1', '2'])
-y_test_labeled = y_test_modeling[labeled_test_mask]
-y_pred_labeled = y_pred_lr[labeled_test_mask]
-y_proba_labeled = y_proba_lr[labeled_test_mask]
-
+print(f"\nFiltering test set to labeled transactions only...")
 print(f"Evaluating on {len(y_test_labeled):,} labeled test samples")
 print(f"  Illicit: {(y_test_labeled == '1').sum():,}")
 print(f"  Licit: {(y_test_labeled == '2').sum():,}")
@@ -953,10 +836,15 @@ print("\n" + "=" * 60)
 print("LOGISTIC REGRESSION RESULTS")
 print("=" * 60)
 print("\nClassification Report:")
-print(classification_report(y_test_labeled, y_pred_labeled, target_names=['Licit (2)', 'Illicit (1)']))
+print(classification_report(
+    y_test_labeled,
+    y_pred_labeled,
+    labels=['2', '1'],
+    target_names=['Licit (2)', 'Illicit (1)']
+))
 
 print("\nConfusion Matrix:")
-cm = confusion_matrix(y_test_labeled, y_pred_labeled)
+cm = confusion_matrix(y_test_labeled, y_pred_labeled, labels=['2', '1'])
 print(cm)
 print(f"  True Negatives:  {cm[0,0]:,}")
 print(f"  False Positives: {cm[0,1]:,}")
@@ -972,7 +860,7 @@ print(f"\nAUC-ROC: {auc_roc:.4f}")
 print(f"AUC-PR:  {auc_pr:.4f}")
 print(f"MCC:     {mcc:.4f}")
 
-print("\nLogistic Regression training completed")
+print("\n✅ Logistic Regression training completed")
 
 
 # **BASELINE MODEL 2: RANDOM FOREST**
@@ -984,43 +872,62 @@ print("\nLogistic Regression training completed")
 print("TRAINING BASELINE MODEL: RANDOM FOREST")
 print("=" * 60)
 
-from sklearn.ensemble import RandomForestClassifier
+with tqdm(total=4, desc="Random Forest", unit="step", colour="green") as pbar:
+    from sklearn.ensemble import RandomForestClassifier
 
-# Train Random Forest (handles non-linear patterns better than LR)
-print("Training Random Forest...")
-print(f"Using {len(baseline_features)} baseline features for Random Forest")
+    # Step 1: Extract features
+    print("  Step 1: Extracting features...")
+    print(f"  Using {len(baseline_features)} baseline features for Random Forest")
+    X_train_baseline = X_train_modeling[baseline_features]
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Features extracted"})
 
-# Extract baseline features from training data
-X_train_baseline = X_train_modeling[baseline_features]
+    # Step 2: Train Random Forest (handles non-linear patterns better than LR)
+    print("  Step 2: Training Random Forest...")
+    rf_model = RandomForestClassifier(
+        n_estimators=200,           # More trees for better performance
+        max_depth=20,               # Limit depth to prevent overfitting
+        min_samples_split=10,       # Require at least 10 samples to split
+        min_samples_leaf=5,         # At least 5 samples per leaf
+        class_weight='balanced',    # Handle class imbalance
+        random_state=42,
+        n_jobs=-1,                  # Use all CPU cores
+        verbose=0
+    )
+    rf_model.fit(X_train_baseline, y_train_modeling)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Model trained"})
 
-rf_model = RandomForestClassifier(
-    n_estimators=200,           # More trees for better performance
-    max_depth=20,               # Limit depth to prevent overfitting
-    min_samples_split=10,       # Require at least 10 samples to split
-    min_samples_leaf=5,         # At least 5 samples per leaf
-    class_weight='balanced',    # Handle class imbalance
-    random_state=42,
-    n_jobs=-1,                  # Use all CPU cores
-    verbose=0
-)
-rf_model.fit(X_train_baseline, y_train_modeling)
+    # Step 3: Generate predictions
+    print("  Step 3: Generating predictions...")
+    y_pred_rf = rf_model.predict(X_test_modeling)
+    y_proba_rf = rf_model.predict_proba(X_test_modeling)[:, 1]
 
-# Predictions
-y_pred_rf = rf_model.predict(X_test_modeling)
-y_proba_rf = rf_model.predict_proba(X_test_modeling)[:, 1]
+    # Filter to labeled test samples
+    y_pred_rf_labeled = y_pred_rf[labeled_test_mask]
+    y_proba_rf_labeled = y_proba_rf[labeled_test_mask]
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Predictions generated"})
 
-# Filter to labeled test samples
-y_pred_rf_labeled = y_pred_rf[labeled_test_mask]
-y_proba_rf_labeled = y_proba_rf[labeled_test_mask]
+    # Step 4: Evaluate
+    print("  Step 4: Evaluating model...")
+    auc_roc_rf = roc_auc_score(y_test_labeled, y_proba_rf_labeled)
+    pbar.update(1)
+    pbar.set_postfix({"AUC-ROC": f"{auc_roc_rf:.4f}"})
 
 print("\n" + "=" * 60)
 print("RANDOM FOREST RESULTS")
 print("=" * 60)
 print("\nClassification Report:")
-print(classification_report(y_test_labeled, y_pred_rf_labeled, target_names=['Licit (2)', 'Illicit (1)']))
+print(classification_report(
+    y_test_labeled,
+    y_pred_rf_labeled,
+    labels=['2', '1'],
+    target_names=['Licit (2)', 'Illicit (1)']
+))
 
 print("\nConfusion Matrix:")
-cm_rf = confusion_matrix(y_test_labeled, y_pred_rf_labeled)
+cm_rf = confusion_matrix(y_test_labeled, y_pred_rf_labeled, labels=['2', '1'])
 print(cm_rf)
 print(f"  True Negatives:  {cm_rf[0,0]:,}")
 print(f"  False Positives: {cm_rf[0,1]:,}")
@@ -1028,7 +935,6 @@ print(f"  False Negatives: {cm_rf[1,0]:,}")
 print(f"  True Positives:  {cm_rf[1,1]:,}")
 
 # Advanced metrics
-auc_roc_rf = roc_auc_score(y_test_labeled, y_proba_rf_labeled)
 auc_pr_rf = average_precision_score(y_test_labeled, y_proba_rf_labeled, pos_label='1')
 mcc_rf = matthews_corrcoef(y_test_labeled, y_pred_rf_labeled)
 
@@ -1059,45 +965,59 @@ print("\nRandom Forest training completed")
 print("TRAINING BASELINE MODEL: XGBOOST")
 print("=" * 60)
 
-# Calculate scale_pos_weight for imbalance handling
-scale_pos_weight = (y_train_modeling == '2').sum() / (y_train_modeling == '1').sum()
-print(f"\nClass imbalance in training: {scale_pos_weight:.1f}:1")
-print(f"Using scale_pos_weight = {scale_pos_weight:.2f}")
+with tqdm(total=4, desc="XGBoost", unit="step", colour="yellow") as pbar:
+    # Step 1: Prepare data and calculate scale_pos_weight
+    print("  Step 1: Preparing data and calculating class weights...")
+    scale_pos_weight = (y_train_modeling == '2').sum() / (y_train_modeling == '1').sum()
+    print(f"  Class imbalance in training: {scale_pos_weight:.1f}:1")
+    print(f"  Using scale_pos_weight = {scale_pos_weight:.2f}")
+    
+    # Convert string labels to numeric for XGBoost
+    label_map = {'2': 0, '1': 1}  # 0=licit, 1=illicit
+    y_train_numeric = y_train_modeling.map(label_map)
+    y_test_numeric = y_test_modeling.map(label_map)
+    y_test_labeled_numeric = y_test_labeled.map(label_map)
+    
+    print(f"  Using {len(baseline_features)} baseline features for XGBoost")
+    X_train_baseline = X_train_modeling[baseline_features]
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Data prepared"})
 
-# Convert string labels to numeric for XGBoost
-label_map = {'2': 0, '1': 1}  # 0=licit, 1=illicit
-y_train_numeric = y_train_modeling.map(label_map)
-y_test_numeric = y_test_modeling.map(label_map)
-y_test_labeled_numeric = y_test_labeled.map(label_map)
+    # Step 2: Train XGBoost
+    print("  Step 2: Training XGBoost...")
+    xgb_model = xgb.XGBClassifier(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=scale_pos_weight,  # Handle imbalance
+        objective='binary:logistic',
+        eval_metric='aucpr',
+        random_state=42,
+        n_jobs=-1,
+        verbosity=0
+    )
+    xgb_model.fit(X_train_baseline, y_train_numeric)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Model trained"})
 
-print("\nTraining XGBoost...")
-print(f"Using {len(baseline_features)} baseline features for XGBoost")
+    # Step 3: Generate predictions
+    print("  Step 3: Generating predictions...")
+    y_pred_xgb = xgb_model.predict(X_test_modeling)
+    y_proba_xgb = xgb_model.predict_proba(X_test_modeling)[:, 1]
 
-# Extract baseline features from training data
-X_train_baseline = X_train_modeling[baseline_features]
+    # Filter to labeled test samples
+    y_pred_xgb_labeled = y_pred_xgb[labeled_test_mask]
+    y_proba_xgb_labeled = y_proba_xgb[labeled_test_mask]
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Predictions generated"})
 
-xgb_model = xgb.XGBClassifier(
-    n_estimators=200,
-    max_depth=6,
-    learning_rate=0.1,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    scale_pos_weight=scale_pos_weight,  # Handle imbalance
-    objective='binary:logistic',
-    eval_metric='aucpr',
-    random_state=42,
-    n_jobs=-1,
-    verbosity=0
-)
-xgb_model.fit(X_train_baseline, y_train_numeric)
-
-# Predictions
-y_pred_xgb = xgb_model.predict(X_test_modeling)
-y_proba_xgb = xgb_model.predict_proba(X_test_modeling)[:, 1]
-
-# Filter to labeled test samples
-y_pred_xgb_labeled = y_pred_xgb[labeled_test_mask]
-y_proba_xgb_labeled = y_proba_xgb[labeled_test_mask]
+    # Step 4: Evaluate
+    print("  Step 4: Evaluating model...")
+    auc_roc_xgb = roc_auc_score(y_test_labeled_numeric, y_proba_xgb_labeled)
+    pbar.update(1)
+    pbar.set_postfix({"AUC-ROC": f"{auc_roc_xgb:.4f}"})
 
 print("\n" + "=" * 60)
 print("XGBOOST RESULTS")
@@ -1114,7 +1034,6 @@ print(f"  False Negatives: {cm_xgb[1,0]:,}")
 print(f"  True Positives:  {cm_xgb[1,1]:,}")
 
 # Advanced metrics
-auc_roc_xgb = roc_auc_score(y_test_labeled_numeric, y_proba_xgb_labeled)
 auc_pr_xgb = average_precision_score(y_test_labeled_numeric, y_proba_xgb_labeled)
 mcc_xgb = matthews_corrcoef(y_test_labeled_numeric, y_pred_xgb_labeled)
 
@@ -1246,90 +1165,111 @@ print("\nThreshold optimization completed")
 print("ENSEMBLE MODEL - WEIGHTED VOTING")
 print("=" * 60)
 
-# Combine predictions from all three models using weighted averaging
-# Give more weight to better-performing models based on their AUC-ROC scores
+with tqdm(total=5, desc="Ensemble Model", unit="step", colour="magenta") as pbar:
+    # Step 1: Validate individual model probabilities
+    print("  Step 1: Validating individual model probabilities...")
+    print("\n  Individual model AUC-ROC scores:")
+    print(f"    Logistic Regression: {auc_roc:.4f}")
+    print(f"    Random Forest:       {auc_roc_rf:.4f}")
+    print(f"    XGBoost:            {auc_roc_xgb:.4f}")
 
-print("Individual model AUC-ROC scores:")
-print(f"  Logistic Regression: {auc_roc:.4f}")
-print(f"  Random Forest:       {auc_roc_rf:.4f}")
-print(f"  XGBoost:            {auc_roc_xgb:.4f}")
+    # CRITICAL FIX: Ensure all probabilities represent P(illicit=1)
+    # LR and RF use string labels ('1', '2'), XGB uses numeric (0, 1)
+    # Need to extract correct probability column for each model
 
-# CRITICAL FIX: Ensure all probabilities represent P(illicit=1)
-# LR and RF use string labels ('1', '2'), XGB uses numeric (0, 1)
-# Need to extract correct probability column for each model
+    print("\n  Checking probability alignment...")
+    print(f"    LR proba shape: {lr_model.predict_proba(X_test_scaled).shape}")
+    print(f"    LR classes: {lr_model.classes_}")
+    print(f"    RF classes: {rf_model.classes_}")
+    print(f"    XGB classes: {xgb_model.classes_}")
 
-print("\nDEBUG: Checking probability alignment...")
-print(f"  LR proba shape: {lr_model.predict_proba(X_test_scaled).shape}")
-print(f"  LR classes: {lr_model.classes_}")
-print(f"  RF classes: {rf_model.classes_}")
-print(f"  XGB classes: {xgb_model.classes_}")
+    # For LR and RF with string labels, find which column corresponds to '1' (illicit)
+    lr_illicit_idx = list(lr_model.classes_).index('1')
+    rf_illicit_idx = list(rf_model.classes_).index('1')
 
-# For LR and RF with string labels, find which column corresponds to '1' (illicit)
-lr_illicit_idx = list(lr_model.classes_).index('1')
-rf_illicit_idx = list(rf_model.classes_).index('1')
+    # Get probabilities for illicit class ('1') from each model
+    y_proba_lr_all = lr_model.predict_proba(X_test_scaled)[:, lr_illicit_idx]
+    y_proba_rf_all = rf_model.predict_proba(X_test_modeling)[:, rf_illicit_idx]
+    y_proba_xgb_all = y_proba_xgb  # Already correct (column 1 = illicit)
 
-# Get probabilities for illicit class ('1') from each model
-y_proba_lr_all = lr_model.predict_proba(X_test_scaled)[:, lr_illicit_idx]
-y_proba_rf_all = rf_model.predict_proba(X_test_modeling)[:, rf_illicit_idx]
-y_proba_xgb_all = y_proba_xgb  # Already correct (column 1 = illicit)
+    # Filter to labeled test samples
+    y_proba_lr_labeled_fixed = y_proba_lr_all[labeled_test_mask]
+    y_proba_rf_labeled_fixed = y_proba_rf_all[labeled_test_mask]
+    y_proba_xgb_labeled_fixed = y_proba_xgb_labeled  # Already filtered and correct
 
-# Filter to labeled test samples
-y_proba_lr_labeled_fixed = y_proba_lr_all[labeled_test_mask]
-y_proba_rf_labeled_fixed = y_proba_rf_all[labeled_test_mask]
-y_proba_xgb_labeled_fixed = y_proba_xgb_labeled  # Already filtered and correct
+    print(f"\n  Probability statistics for illicit class:")
+    print(f"    LR mean: {y_proba_lr_labeled_fixed.mean():.4f}")
+    print(f"    RF mean: {y_proba_rf_labeled_fixed.mean():.4f}")
+    print(f"    XGB mean: {y_proba_xgb_labeled_fixed.mean():.4f}")
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Probabilities validated"})
 
-print(f"\nDEBUG: Probability statistics for illicit class:")
-print(f"  LR mean: {y_proba_lr_labeled_fixed.mean():.4f}")
-print(f"  RF mean: {y_proba_rf_labeled_fixed.mean():.4f}")
-print(f"  XGB mean: {y_proba_xgb_labeled_fixed.mean():.4f}")
+    # Step 2: Calculate ensemble weights
+    print("\n  Step 2: Calculating ensemble weights...")
+    total_auc = auc_roc + auc_roc_rf + auc_roc_xgb
+    weight_lr = auc_roc / total_auc
+    weight_rf = auc_roc_rf / total_auc
+    weight_xgb = auc_roc_xgb / total_auc
 
-# Calculate weights proportional to AUC-ROC scores
-total_auc = auc_roc + auc_roc_rf + auc_roc_xgb
-weight_lr = auc_roc / total_auc
-weight_rf = auc_roc_rf / total_auc
-weight_xgb = auc_roc_xgb / total_auc
+    print(f"\n  Ensemble weights (based on AUC-ROC):")
+    print(f"    Logistic Regression: {weight_lr:.3f}")
+    print(f"    Random Forest:       {weight_rf:.3f}")
+    print(f"    XGBoost:            {weight_xgb:.3f}")
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Weights calculated"})
 
-print(f"\nEnsemble weights:")
-print(f"  Logistic Regression: {weight_lr:.3f}")
-print(f"  Random Forest:       {weight_rf:.3f}")
-print(f"  XGBoost:            {weight_xgb:.3f}")
+    # Step 3: Combine predictions with weighted averaging
+    print("\n  Step 3: Combining predictions with weighted averaging...")
+    y_proba_ensemble = (
+        weight_lr * y_proba_lr_labeled_fixed +
+        weight_rf * y_proba_rf_labeled_fixed +
+        weight_xgb * y_proba_xgb_labeled_fixed
+    )
 
-# Weighted average of probabilities
-y_proba_ensemble = (
-    weight_lr * y_proba_lr_labeled_fixed +
-    weight_rf * y_proba_rf_labeled_fixed +
-    weight_xgb * y_proba_xgb_labeled_fixed
-)
+    print(f"\n  Ensemble probability statistics:")
+    print(f"    Mean: {y_proba_ensemble.mean():.4f}")
+    print(f"    Min: {y_proba_ensemble.min():.4f}")
+    print(f"    Max: {y_proba_ensemble.max():.4f}")
 
-print(f"\nDEBUG: Ensemble probability statistics:")
-print(f"  Mean: {y_proba_ensemble.mean():.4f}")
-print(f"  Min: {y_proba_ensemble.min():.4f}")
-print(f"  Max: {y_proba_ensemble.max():.4f}")
+    # Apply default threshold (0.5)
+    y_pred_ensemble = (y_proba_ensemble >= 0.5).astype(int)
 
-# Apply default threshold (0.5)
-y_pred_ensemble = (y_proba_ensemble >= 0.5).astype(int)
+    # Convert to match original label format for evaluation
+    y_pred_ensemble_str = pd.Series(y_pred_ensemble).map({0: '2', 1: '1'})
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Predictions combined"})
 
-# Convert to match original label format for evaluation
-y_pred_ensemble_str = pd.Series(y_pred_ensemble).map({0: '2', 1: '1'})
+    # Step 4: Evaluate ensemble model
+    print("\n  Step 4: Evaluating ensemble model...")
+    auc_roc_ensemble = roc_auc_score(y_test_labeled_numeric, y_proba_ensemble)
+    auc_pr_ensemble = average_precision_score(y_test_labeled_numeric, y_proba_ensemble)
+    mcc_ensemble = matthews_corrcoef(y_test_labeled, y_pred_ensemble_str)
+    pbar.update(1)
+    pbar.set_postfix({"AUC-ROC": f"{auc_roc_ensemble:.4f}"})
+
+    # Step 5: Generate confusion matrix
+    print("\n  Step 5: Generating confusion matrix...")
+    cm_ensemble = confusion_matrix(y_test_labeled, y_pred_ensemble_str, labels=['2', '1'])
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Evaluation complete"})
 
 print("\n" + "=" * 60)
 print("ENSEMBLE MODEL RESULTS")
 print("=" * 60)
 print("\nClassification Report:")
-print(classification_report(y_test_labeled, y_pred_ensemble_str, target_names=['Licit (2)', 'Illicit (1)']))
+print(classification_report(
+    y_test_labeled,
+    y_pred_ensemble_str,
+    labels=['2', '1'],
+    target_names=['Licit (2)', 'Illicit (1)']
+))
 
 print("\nConfusion Matrix:")
-cm_ensemble = confusion_matrix(y_test_labeled, y_pred_ensemble_str)
 print(cm_ensemble)
 print(f"  True Negatives:  {cm_ensemble[0,0]:,}")
 print(f"  False Positives: {cm_ensemble[0,1]:,}")
 print(f"  False Negatives: {cm_ensemble[1,0]:,}")
 print(f"  True Positives:  {cm_ensemble[1,1]:,}")
-
-# Advanced metrics
-auc_roc_ensemble = roc_auc_score(y_test_labeled_numeric, y_proba_ensemble)
-auc_pr_ensemble = average_precision_score(y_test_labeled_numeric, y_proba_ensemble)
-mcc_ensemble = matthews_corrcoef(y_test_labeled, y_pred_ensemble_str)
 
 print(f"\nAUC-ROC: {auc_roc_ensemble:.4f}")
 print(f"AUC-PR:  {auc_pr_ensemble:.4f}")
@@ -1434,6 +1374,25 @@ print(f"""
 
 print("Model comparison completed")
 
+# ============================================================================
+# SECTION: EXTENDED COMPARISON WITH DEEP LEARNING MODELS
+# ============================================================================
+# NOTE: This section will be populated after LSTM, GNN, and Hybrid training
+# For now, store the ML models' results for later comparison
+
+ml_models_results = {
+    'Logistic Regression': {'y_pred': y_pred_lr_numeric, 'y_proba': y_proba_lr_labeled_fixed},
+    'Random Forest': {'y_pred': (y_pred_rf_labeled == '1').astype(int), 'y_proba': y_proba_rf_labeled_fixed},
+    'XGBoost': {'y_pred': y_pred_xgb_labeled, 'y_proba': y_proba_xgb_labeled},
+    'Ensemble (ML)': {'y_pred': y_pred_ensemble, 'y_proba': y_proba_ensemble}
+}
+
+print("\n" + "=" * 80)
+print("ML MODELS STORED FOR COMPARISON WITH DEEP LEARNING MODELS")
+print("=" * 80)
+print(f"✓ 4 ML models trained and stored")
+print(f"✓ All evaluated on {len(y_test_labeled):,} labeled test transactions")
+print(f"✓ Waiting for LSTM, GNN, and Hybrid model results...")
 
 # In[ ]:
 
@@ -1443,149 +1402,161 @@ print("=" * 80)
 print("CREATING THESIS VISUALIZATIONS")
 print("=" * 80)
 
-# Import additional plotting libraries
-from sklearn.metrics import roc_curve, precision_recall_curve
+with tqdm(total=4, desc="Visualization", unit="plot", colour="cyan") as pbar:
+    # Import additional plotting libraries
+    from sklearn.metrics import roc_curve, precision_recall_curve
 
-# Create figure with 2x2 subplots
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-fig.suptitle('Model Performance Comparison - Illicit Transaction Detection', 
-             fontsize=16, fontweight='bold', y=0.995)
+    # Create figure with 2x2 subplots
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig.suptitle('Model Performance Comparison - Illicit Transaction Detection', 
+                 fontsize=16, fontweight='bold', y=0.995)
 
-# ============================================================================
-# PLOT 1: ROC Curves (Top Left)
-# ============================================================================
-ax1 = axes[0, 0]
+    # ============================================================================
+    # PLOT 1: ROC Curves (Top Left)
+    # ============================================================================
+    print("  Creating ROC Curves...")
+    ax1 = axes[0, 0]
 
-# Calculate ROC curves for each model
-fpr_lr, tpr_lr, _ = roc_curve(y_test_labeled_numeric, y_proba_labeled)
-fpr_rf, tpr_rf, _ = roc_curve(y_test_labeled_numeric, y_proba_rf_labeled)
-fpr_xgb, tpr_xgb, _ = roc_curve(y_test_labeled_numeric, y_proba_xgb_labeled)
-fpr_ens, tpr_ens, _ = roc_curve(y_test_labeled_numeric, y_proba_ensemble)
+    # Calculate ROC curves for each model
+    fpr_lr, tpr_lr, _ = roc_curve(y_test_labeled_numeric, y_proba_labeled)
+    fpr_rf, tpr_rf, _ = roc_curve(y_test_labeled_numeric, y_proba_rf_labeled)
+    fpr_xgb, tpr_xgb, _ = roc_curve(y_test_labeled_numeric, y_proba_xgb_labeled)
+    fpr_ens, tpr_ens, _ = roc_curve(y_test_labeled_numeric, y_proba_ensemble)
 
-# Plot each model
-ax1.plot(fpr_lr, tpr_lr, label=f'Logistic Regression (AUC={auc_roc:.3f})', 
-         linewidth=2, color='blue')
-ax1.plot(fpr_rf, tpr_rf, label=f'Random Forest (AUC={auc_roc_rf:.3f})', 
-         linewidth=2, color='green')
-ax1.plot(fpr_xgb, tpr_xgb, label=f'XGBoost (AUC={auc_roc_xgb:.3f})', 
-         linewidth=2, color='red')
-ax1.plot(fpr_ens, tpr_ens, label=f'Ensemble (AUC={auc_roc_ensemble:.3f})', 
-         linewidth=2, color='purple', linestyle='--')
+    # Plot each model
+    ax1.plot(fpr_lr, tpr_lr, label=f'Logistic Regression (AUC={auc_roc:.3f})', 
+             linewidth=2, color='blue')
+    ax1.plot(fpr_rf, tpr_rf, label=f'Random Forest (AUC={auc_roc_rf:.3f})', 
+             linewidth=2, color='green')
+    ax1.plot(fpr_xgb, tpr_xgb, label=f'XGBoost (AUC={auc_roc_xgb:.3f})', 
+             linewidth=2, color='red')
+    ax1.plot(fpr_ens, tpr_ens, label=f'Ensemble (AUC={auc_roc_ensemble:.3f})', 
+             linewidth=2, color='purple', linestyle='--')
 
-# Add diagonal reference line (random classifier)
-ax1.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5, label='Random Classifier')
+    # Add diagonal reference line (random classifier)
+    ax1.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.5, label='Random Classifier')
 
-ax1.set_xlabel('False Positive Rate', fontsize=12)
-ax1.set_ylabel('True Positive Rate', fontsize=12)
-ax1.set_title('ROC Curves - Model Discrimination Ability', fontsize=13, fontweight='bold')
-ax1.legend(loc='lower right', fontsize=10)
-ax1.grid(True, alpha=0.3)
+    ax1.set_xlabel('False Positive Rate', fontsize=12)
+    ax1.set_ylabel('True Positive Rate', fontsize=12)
+    ax1.set_title('ROC Curves - Model Discrimination Ability', fontsize=13, fontweight='bold')
+    ax1.legend(loc='lower right', fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ ROC curves"})
 
-# ============================================================================
-# PLOT 2: Precision-Recall Curves (Top Right)
-# ============================================================================
-ax2 = axes[0, 1]
+    # ============================================================================
+    # PLOT 2: Precision-Recall Curves (Top Right)
+    # ============================================================================
+    print("  Creating PR Curves...")
+    ax2 = axes[0, 1]
 
-# Calculate PR curves for each model
-precision_lr, recall_lr, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_labeled)
-precision_rf, recall_rf, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_rf_labeled)
-precision_xgb, recall_xgb, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_xgb_labeled)
-precision_ens, recall_ens, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_ensemble)
+    # Calculate PR curves for each model
+    precision_lr, recall_lr, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_labeled)
+    precision_rf, recall_rf, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_rf_labeled)
+    precision_xgb, recall_xgb, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_xgb_labeled)
+    precision_ens, recall_ens, _ = precision_recall_curve(y_test_labeled_numeric, y_proba_ensemble)
 
-# Plot each model
-ax2.plot(recall_lr, precision_lr, label=f'Logistic Regression (AP={auc_pr:.3f})', 
-         linewidth=2, color='blue')
-ax2.plot(recall_rf, precision_rf, label=f'Random Forest (AP={auc_pr_rf:.3f})', 
-         linewidth=2, color='green')
-ax2.plot(recall_xgb, precision_xgb, label=f'XGBoost (AP={auc_pr_xgb:.3f})', 
-         linewidth=2, color='red')
-ax2.plot(recall_ens, precision_ens, label=f'Ensemble (AP={auc_pr_ensemble:.3f})', 
-         linewidth=2, color='purple', linestyle='--')
+    # Plot each model
+    ax2.plot(recall_lr, precision_lr, label=f'Logistic Regression (AP={auc_pr:.3f})', 
+             linewidth=2, color='blue')
+    ax2.plot(recall_rf, precision_rf, label=f'Random Forest (AP={auc_pr_rf:.3f})', 
+             linewidth=2, color='green')
+    ax2.plot(recall_xgb, precision_xgb, label=f'XGBoost (AP={auc_pr_xgb:.3f})', 
+             linewidth=2, color='red')
+    ax2.plot(recall_ens, precision_ens, label=f'Ensemble (AP={auc_pr_ensemble:.3f})', 
+             linewidth=2, color='purple', linestyle='--')
 
-# Add baseline (proportion of positive class)
-baseline_precision = (y_test_labeled_numeric == 1).sum() / len(y_test_labeled_numeric)
-ax2.axhline(y=baseline_precision, color='k', linestyle='--', linewidth=1, 
-            alpha=0.5, label=f'Baseline ({baseline_precision:.3f})')
+    # Add baseline (proportion of positive class)
+    baseline_precision = (y_test_labeled_numeric == 1).sum() / len(y_test_labeled_numeric)
+    ax2.axhline(y=baseline_precision, color='k', linestyle='--', linewidth=1, 
+                alpha=0.5, label=f'Baseline ({baseline_precision:.3f})')
 
-ax2.set_xlabel('Recall (Sensitivity)', fontsize=12)
-ax2.set_ylabel('Precision', fontsize=12)
-ax2.set_title('Precision-Recall Curves - Imbalanced Data Performance', 
-              fontsize=13, fontweight='bold')
-ax2.legend(loc='upper right', fontsize=10)
-ax2.grid(True, alpha=0.3)
+    ax2.set_xlabel('Recall (Sensitivity)', fontsize=12)
+    ax2.set_ylabel('Precision', fontsize=12)
+    ax2.set_title('Precision-Recall Curves - Imbalanced Data Performance', 
+                  fontsize=13, fontweight='bold')
+    ax2.legend(loc='upper right', fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ PR curves"})
 
-# ============================================================================
-# PLOT 3: Threshold Optimization (Bottom Left)
-# ============================================================================
-ax3 = axes[1, 0]
+    # ============================================================================
+    # PLOT 3: Threshold Optimization (Bottom Left)
+    # ============================================================================
+    print("  Creating Threshold Optimization...")
+    ax3 = axes[1, 0]
 
-# Plot metrics vs threshold
-ax3.plot(threshold_df['threshold'], threshold_df['precision'], 
-         label='Precision', linewidth=2, color='blue', marker='o', markersize=4)
-ax3.plot(threshold_df['threshold'], threshold_df['recall'], 
-         label='Recall', linewidth=2, color='green', marker='s', markersize=4)
-ax3.plot(threshold_df['threshold'], threshold_df['f1_score'], 
-         label='F1-Score', linewidth=2, color='red', marker='^', markersize=4)
-ax3.plot(threshold_df['threshold'], threshold_df['specificity'], 
-         label='Specificity', linewidth=2, color='orange', marker='d', markersize=4)
+    # Plot metrics vs threshold
+    ax3.plot(threshold_df['threshold'], threshold_df['precision'], 
+             label='Precision', linewidth=2, color='blue', marker='o', markersize=4)
+    ax3.plot(threshold_df['threshold'], threshold_df['recall'], 
+             label='Recall', linewidth=2, color='green', marker='s', markersize=4)
+    ax3.plot(threshold_df['threshold'], threshold_df['f1_score'], 
+             label='F1-Score', linewidth=2, color='red', marker='^', markersize=4)
+    ax3.plot(threshold_df['threshold'], threshold_df['specificity'], 
+             label='Specificity', linewidth=2, color='orange', marker='d', markersize=4)
 
-# Mark optimal threshold
-optimal_thresh = threshold_df.loc[best_f1_idx, 'threshold']
-optimal_f1 = threshold_df.loc[best_f1_idx, 'f1_score']
-ax3.axvline(x=optimal_thresh, color='red', linestyle='--', linewidth=1.5, 
-            alpha=0.7, label=f'Optimal Threshold ({optimal_thresh:.2f})')
-ax3.scatter([optimal_thresh], [optimal_f1], color='red', s=100, zorder=5, marker='*')
+    # Mark optimal threshold
+    optimal_thresh = threshold_df.loc[best_f1_idx, 'threshold']
+    optimal_f1 = threshold_df.loc[best_f1_idx, 'f1_score']
+    ax3.axvline(x=optimal_thresh, color='red', linestyle='--', linewidth=1.5, 
+                alpha=0.7, label=f'Optimal Threshold ({optimal_thresh:.2f})')
+    ax3.scatter([optimal_thresh], [optimal_f1], color='red', s=100, zorder=5, marker='*')
 
-ax3.set_xlabel('Decision Threshold', fontsize=12)
-ax3.set_ylabel('Metric Value', fontsize=12)
-ax3.set_title('Threshold Optimization - XGBoost Model', fontsize=13, fontweight='bold')
-ax3.legend(loc='best', fontsize=10)
-ax3.grid(True, alpha=0.3)
-ax3.set_xlim(0.1, 0.9)
-ax3.set_ylim(0, 1)
+    ax3.set_xlabel('Decision Threshold', fontsize=12)
+    ax3.set_ylabel('Metric Value', fontsize=12)
+    ax3.set_title('Threshold Optimization - XGBoost Model', fontsize=13, fontweight='bold')
+    ax3.legend(loc='best', fontsize=10)
+    ax3.grid(True, alpha=0.3)
+    ax3.set_xlim(0.1, 0.9)
+    ax3.set_ylim(0, 1)
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ Threshold analysis"})
 
-# ============================================================================
-# PLOT 4: Model Comparison Bar Chart (Bottom Right)
-# ============================================================================
-ax4 = axes[1, 1]
+    # ============================================================================
+    # PLOT 4: Model Comparison Bar Chart (Bottom Right)
+    # ============================================================================
+    print("  Creating Model Comparison...")
+    ax4 = axes[1, 1]
 
-# Prepare data for bar chart
-models = ['LR', 'RF', 'XGB', 'Ensemble']
-metrics_data = {
-    'Precision': [prec_lr, prec_rf, prec_xgb, prec_ens],
-    'Recall': [rec_lr, rec_rf, rec_xgb, rec_ens],
-    'F1-Score': [f1_lr, f1_rf, f1_xgb, f1_ens]
-}
+    # Prepare data for bar chart
+    models = ['LR', 'RF', 'XGB', 'Ensemble']
+    metrics_data = {
+        'Precision': [prec_lr, prec_rf, prec_xgb, prec_ens],
+        'Recall': [rec_lr, rec_rf, rec_xgb, rec_ens],
+        'F1-Score': [f1_lr, f1_rf, f1_xgb, f1_ens]
+    }
 
-x = np.arange(len(models))
-width = 0.25
+    x = np.arange(len(models))
+    width = 0.25
 
-# Create grouped bar chart
-bars1 = ax4.bar(x - width, metrics_data['Precision'], width, label='Precision', color='blue', alpha=0.8)
-bars2 = ax4.bar(x, metrics_data['Recall'], width, label='Recall', color='green', alpha=0.8)
-bars3 = ax4.bar(x + width, metrics_data['F1-Score'], width, label='F1-Score', color='red', alpha=0.8)
+    # Create grouped bar chart
+    bars1 = ax4.bar(x - width, metrics_data['Precision'], width, label='Precision', color='blue', alpha=0.8)
+    bars2 = ax4.bar(x, metrics_data['Recall'], width, label='Recall', color='green', alpha=0.8)
+    bars3 = ax4.bar(x + width, metrics_data['F1-Score'], width, label='F1-Score', color='red', alpha=0.8)
 
-# Add value labels on bars
-for bars in [bars1, bars2, bars3]:
-    for bar in bars:
-        height = bar.get_height()
-        ax4.text(bar.get_x() + bar.get_width()/2., height,
-                f'{height:.3f}', ha='center', va='bottom', fontsize=8)
+    # Add value labels on bars
+    for bars in [bars1, bars2, bars3]:
+        for bar in bars:
+            height = bar.get_height()
+            ax4.text(bar.get_x() + bar.get_width()/2., height,
+                    f'{height:.3f}', ha='center', va='bottom', fontsize=8)
 
-ax4.set_xlabel('Models', fontsize=12)
-ax4.set_ylabel('Score', fontsize=12)
-ax4.set_title('Model Performance Comparison - Fraud Detection Metrics', 
-              fontsize=13, fontweight='bold')
-ax4.set_xticks(x)
-ax4.set_xticklabels(models)
-ax4.legend(loc='upper left', fontsize=10)
-ax4.grid(True, alpha=0.3, axis='y')
-ax4.set_ylim(0, 1)
+    ax4.set_xlabel('Models', fontsize=12)
+    ax4.set_ylabel('Score', fontsize=12)
+    ax4.set_title('Model Performance Comparison - Fraud Detection Metrics', 
+                  fontsize=13, fontweight='bold')
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(models)
+    ax4.legend(loc='upper left', fontsize=10)
+    ax4.grid(True, alpha=0.3, axis='y')
+    ax4.set_ylim(0, 1)
 
-plt.tight_layout()
-plt.savefig('model_comparison_visualization.png', dpi=300, bbox_inches='tight')
-print("\nVisualization saved as 'model_comparison_visualization.png'")
-plt.show()
+    plt.tight_layout()
+    plt.savefig('model_comparison_visualization.png', dpi=300, bbox_inches='tight')
+    print("  Visualization saved as 'model_comparison_visualization.png'")
+    pbar.update(1)
+    pbar.set_postfix({"status": "✓ All plots complete"})
 
 print("\n" + "=" * 80)
 print("VISUALIZATION COMPLETE!")
@@ -1736,14 +1707,7 @@ print("=" * 80)
 print("DEEP LEARNING ENVIRONMENT SETUP")
 print("=" * 80)
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, TensorDataset
-from torch_geometric.data import Data
-from torch_geometric.nn import SAGEConv, GCNConv, GATConv, global_mean_pool
-import torch_geometric.transforms as T
+
 
 # Check PyTorch installation and configure device
 print(f"\nPyTorch Version: {torch.__version__}")
@@ -1805,16 +1769,20 @@ print("=" * 80)
 print("PREPARING TEMPORAL SEQUENCE DATA FOR LSTM")
 print("=" * 80)
 
-# Prepare training sequences (from SMOTE-balanced data)
+# Prepare training sequences using ONLY real labeled nodes in the training window (time_step ≤ 35)
 print("Converting training data to PyTorch tensors...")
 
-# Use LSTM features (original + temporal features)
-X_train_lstm_df = X_train_modeling[lstm_features]
+train_temporal_df = data[(data['time_step'] <= 35) & (data['class_label'].isin(['1', '2']))].set_index('node_ID')
+test_temporal_df = data[(data['time_step'] > 35) & (data['class_label'].isin(['1', '2']))].set_index('node_ID')
+
+X_train_lstm_df = train_temporal_df[lstm_features]
+y_train_lstm = (train_temporal_df['class_label'] == '1').astype(int)
+
 print(f"LSTM training features: {len(lstm_features)} ({len(original_features)} original + {len(temporal_features)} temporal)")
 
 # Convert pandas to numpy first, then to tensors on the selected device
 X_train_np = X_train_lstm_df.values.astype(np.float32)
-y_train_np = (y_train_modeling == '1').astype(int).values.astype(np.int64)
+y_train_np = y_train_lstm.values.astype(np.int64)
 
 with torch.no_grad():
     X_train_tensor = torch.from_numpy(X_train_np).to(device)
@@ -1832,8 +1800,8 @@ print(f"Training class distribution: {dict(zip(unique, counts))}")
 print("\nConverting test data to PyTorch tensors...")
 # Use LSTM features for test data
 print(f"LSTM test features: {len(lstm_features)}")
-X_test_np = X_test_lstm.values.astype(np.float32)
-y_test_np = (y_test_modeling == '1').astype(int).values.astype(np.int64)
+X_test_np = test_temporal_df[lstm_features].values.astype(np.float32)
+y_test_np = (test_temporal_df['class_label'] == '1').astype(int).values.astype(np.int64)
 
 with torch.no_grad():
     X_test_tensor = torch.from_numpy(X_test_np).to(device)
@@ -1883,6 +1851,21 @@ print("=" * 80)
 print("BUILDING SIMPLIFIED LSTM TEMPORAL MODEL")
 print("=" * 80)
 
+
+# Focal Loss implementation for deep models
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance - focuses on hard examples"""
+    def __init__(self, alpha=0.25, gamma=2.0, weight=None):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+    def forward(self, inputs, targets):
+        ce_loss = nn.CrossEntropyLoss(weight=self.weight, reduction='none')(inputs, targets)
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
+
 class SimpleLSTMFraudDetector(nn.Module):
     """
     Simplified LSTM for fraud detection - optimized for CPU training.
@@ -1928,13 +1911,15 @@ class SimpleLSTMFraudDetector(nn.Module):
 
 
 # Use lstm_features for LSTM input dimension
-input_dim = len(lstm_features)  # Should match number of LSTM features
-# Ensure training data uses lstm_features columns
-X_train_lstm = X_train_modeling[lstm_features]
+
+# Use only real labeled nodes (already prepared in train_temporal_df)
+input_dim = len(lstm_features)
+X_train_lstm = X_train_lstm_df
+y_train_lstm = y_train_lstm
 lstm_model = SimpleLSTMFraudDetector(
     input_dim=input_dim,
-    hidden_dim=64,    # Reduced from 128
-    num_layers=1,     # Reduced from 2
+    hidden_dim=64,
+    num_layers=1,
     dropout=0.3
 ).to(device)
 
@@ -1964,42 +1949,24 @@ cpu_device = torch.device('cpu')
 lstm_model = lstm_model.to(cpu_device)
 
 # Training setup from config
+
 num_epochs = DLConfig.NUM_EPOCHS
 learning_rate = DLConfig.LEARNING_RATE
 batch_size = DLConfig.BATCH_SIZE
 patience = DLConfig.PATIENCE
 
-# Calculate class weights to handle remaining imbalance
+# Calculate class weights for real node training set
 from sklearn.utils.class_weight import compute_class_weight
-y_train_np = y_train_tensor.cpu().numpy()
+y_train_np = y_train_lstm.values if hasattr(y_train_lstm, 'values') else y_train_lstm
 class_weights_array = compute_class_weight('balanced', classes=np.unique(y_train_np), y=y_train_np)
 class_weights = torch.tensor(class_weights_array, dtype=torch.float32, device=cpu_device)
 print(f"\nClass weights computed: {class_weights.cpu().numpy()}")
 print(f"  Class 0 (licit) weight: {class_weights[0]:.4f}")
 print(f"  Class 1 (illicit) weight: {class_weights[1]:.4f}")
 
-# Focal Loss implementation (alternative to CrossEntropyLoss for hard examples)
-class FocalLoss(nn.Module):
-    """Focal Loss for addressing class imbalance - focuses on hard examples"""
-    def __init__(self, alpha=0.25, gamma=2.0, weight=None):
-        super(FocalLoss, self).__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.weight = weight
-    
-    def forward(self, inputs, targets):
-        ce_loss = nn.CrossEntropyLoss(weight=self.weight, reduction='none')(inputs, targets)
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        return focal_loss.mean()
-
-# Loss function with class weights to emphasize minority class (illicit)
-# Option 1: Standard CrossEntropyLoss with class weights (current)
-criterion = nn.CrossEntropyLoss(weight=class_weights)
-
-# Option 2: Focal Loss (uncomment to use - better for noisy labels and hard examples)
-# criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=class_weights)
-# print("Using Focal Loss with alpha=0.25, gamma=2.0")
+# Use Focal Loss for deep models
+criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=class_weights)
+print("Using Focal Loss with alpha=0.25, gamma=2.0")
 optimizer = torch.optim.Adam(lstm_model.parameters(), lr=learning_rate, weight_decay=DLConfig.WEIGHT_DECAY)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
 
@@ -2033,99 +2000,100 @@ with torch.no_grad():
     test_out = lstm_model(test_batch)
     print(f"Sanity check passed - Model forward pass OK\n")
 
-# Training loop
-for epoch in range(num_epochs):
-    lstm_model.train()
-    train_loss = 0.0
-    epoch_start = time.time()
+# Training loop with progress bars
+with tqdm(total=num_epochs, desc="LSTM Training", unit="epoch", colour="blue") as epoch_pbar:
+    for epoch in range(num_epochs):
+        lstm_model.train()
+        train_loss = 0.0
+        epoch_start = time.time()
 
-    # Shuffle indices
-    indices = torch.randperm(num_train_samples)
+        # Shuffle indices
+        indices = torch.randperm(num_train_samples)
 
-    # Training batches
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, num_train_samples)
-        batch_indices = indices[start_idx:end_idx]
+        # Training batches with progress bar
+        with tqdm(total=num_batches, desc=f"  Epoch {epoch+1}", unit="batch", leave=False, colour="cyan") as batch_pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_train_samples)
+                batch_indices = indices[start_idx:end_idx]
 
-        batch_X = X_train_tensor[batch_indices]
-        batch_y = y_train_tensor[batch_indices]
+                batch_X = X_train_tensor[batch_indices]
+                batch_y = y_train_tensor[batch_indices]
 
-        # Forward pass
-        optimizer.zero_grad()
-        batch_X = batch_X.to(lstm_model.fc1.weight.device)
-        outputs = lstm_model(batch_X)
-        batch_y = batch_y.to(outputs.device)
-        loss = criterion(outputs, batch_y)
+                # Forward pass
+                optimizer.zero_grad()
+                batch_X = batch_X.to(lstm_model.fc1.weight.device)
+                outputs = lstm_model(batch_X)
+                batch_y = batch_y.to(outputs.device)
+                loss = criterion(outputs, batch_y)
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+                # Backward pass
+                loss.backward()
+                optimizer.step()
 
-        train_loss += loss.item()
+                train_loss += loss.item()
 
-        # Progress every 200 batches
-        if (batch_idx + 1) % 200 == 0:
-            elapsed = time.time() - start_time
-            print(f"  Epoch {epoch+1}/{num_epochs} | Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f} | Time: {elapsed:.0f}s")
+                # Update batch progress bar
+                batch_pbar.update(1)
+                batch_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    train_loss /= num_batches
-    train_losses.append(train_loss)
+        train_loss /= num_batches
+        train_losses.append(train_loss)
 
-    # Validation
-    lstm_model.eval()
-    val_loss = 0.0
-    num_val_samples = len(X_test_tensor)
-    num_val_batches = (num_val_samples + batch_size - 1) // batch_size
+        # Validation
+        lstm_model.eval()
+        val_loss = 0.0
+        num_val_samples = len(X_test_tensor)
+        num_val_batches = (num_val_samples + batch_size - 1) // batch_size
 
-    with torch.no_grad():
-        for batch_idx in range(num_val_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_val_samples)
+        with torch.no_grad():
+            for batch_idx in range(num_val_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_val_samples)
 
-            batch_X = X_test_tensor[start_idx:end_idx]
-            batch_y = y_test_tensor[start_idx:end_idx]
+                batch_X = X_test_tensor[start_idx:end_idx]
+                batch_y = y_test_tensor[start_idx:end_idx]
 
-            batch_X = batch_X.to(lstm_model.fc1.weight.device)
-            outputs = lstm_model(batch_X)
-            batch_y = batch_y.to(outputs.device)
-            loss = criterion(outputs, batch_y)
-            val_loss += loss.item()
+                batch_X = batch_X.to(lstm_model.fc1.weight.device)
+                outputs = lstm_model(batch_X)
+                batch_y = batch_y.to(outputs.device)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
 
-    val_loss /= num_val_batches
-    val_losses.append(val_loss)
+        val_loss /= num_val_batches
+        val_losses.append(val_loss)
 
-    scheduler.step(val_loss)
-    
-    # Calculate validation AUC-PR for better monitoring (imbalanced data)
-    lstm_model.eval()
-    with torch.no_grad():
-        X_test_tensor = X_test_tensor.to(lstm_model.fc1.weight.device)
-        val_outputs = lstm_model(X_test_tensor)
-        val_probs = F.softmax(val_outputs, dim=1)[:, 1].cpu().numpy()
-        val_auc_pr = average_precision_score(y_test_tensor.cpu().numpy(), val_probs)
+        scheduler.step(val_loss)
+        
+        # Calculate validation AUC-PR for better monitoring (imbalanced data)
+        lstm_model.eval()
+        with torch.no_grad():
+            X_test_tensor = X_test_tensor.to(lstm_model.fc1.weight.device)
+            val_outputs = lstm_model(X_test_tensor)
+            val_probs = F.softmax(val_outputs, dim=1)[:, 1].cpu().numpy()
+            val_auc_pr = average_precision_score(y_test_tensor.cpu().numpy(), val_probs)
 
-    # Epoch summary
-    epoch_time = time.time() - epoch_start
-    total_time = time.time() - start_time
-    print(f"\nEpoch [{epoch+1}/{num_epochs}] - {epoch_time:.1f}s")
-    print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val AUC-PR: {val_auc_pr:.4f}")
-    print(f"  Total elapsed: {total_time/60:.1f} min")
+        # Epoch summary
+        epoch_time = time.time() - epoch_start
+        total_time = time.time() - start_time
+        
+        # Update epoch progress bar with metrics
+        epoch_pbar.update(1)
+        epoch_pbar.set_postfix({
+            "train_loss": f"{train_loss:.4f}",
+            "val_loss": f"{val_loss:.4f}",
+            "auc_pr": f"{val_auc_pr:.4f}"
+        })
 
-    # Early stopping based on validation loss (could switch to AUC-PR if preferred)
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        patience_counter = 0
-        torch.save(lstm_model.state_dict(), DLConfig.LSTM_MODEL_PATH)
-        print(f"  Model saved (val_loss improved)")
-    else:
-        patience_counter += 1
-        print(f"  No improvement (patience: {patience_counter}/{patience})")
-        if patience_counter >= patience:
-            print(f"\nEarly stopping at epoch {epoch+1}")
-            break
-
-    print("-" * 80)
+        # Early stopping based on validation loss (could switch to AUC-PR if preferred)
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(lstm_model.state_dict(), DLConfig.LSTM_MODEL_PATH)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
 
 # Training complete
 training_time = time.time() - start_time
@@ -2273,16 +2241,29 @@ print(f"Total edges: {len(edge_df):,}")
 print(f"Unique source nodes: {edge_df['txId1'].nunique():,}")
 print(f"Unique target nodes: {edge_df['txId2'].nunique():,}")
 
+# Filter edges to training-period interactions (both endpoints time_step ≤ 35) to avoid future leakage
+node_time_map = data.set_index('node_ID')['time_step'].to_dict()
+edge_df = edge_df[
+    edge_df['txId1'].map(node_time_map).fillna(99) <= 35
+]
+edge_df = edge_df[
+    edge_df['txId2'].map(node_time_map).fillna(99) <= 35
+]
+print(f"Filtered edges for GNN (train-period only): {len(edge_df):,}")
+
 # Get node features from our preprocessed data
-# Use ALL nodes (train + test) for graph structure
-# Use GNN features (original + graph features)
-X_train_gnn_df = X_train_modeling[gnn_features]
-X_test_gnn_df = X_test_gnn
+# Use ALL real nodes (train + test) for graph structure, indexed by node_ID
+node_feature_df = data.set_index('node_ID')
+
+# Ensure all gnn_features exist
+for col in gnn_features:
+    if col not in node_feature_df.columns:
+        node_feature_df[col] = 0
+
+all_nodes_df = node_feature_df[gnn_features].fillna(0)
+all_labels = node_feature_df['class_label']
 
 print(f"GNN features: {len(gnn_features)} ({len(original_features)} original + {len(graph_features)} graph)")
-
-all_nodes_df = pd.concat([X_train_gnn_df, X_test_gnn_df], axis=0)
-all_labels = pd.concat([y_train_modeling, y_test_modeling], axis=0)
 
 print(f"\nTotal nodes with features: {len(all_nodes_df):,}")
 print(f"Feature dimension: {all_nodes_df.shape[1]}")
@@ -2351,10 +2332,9 @@ print(f"\nNode features shape: {x_graph.shape}")
 print(f"Node labels shape: {y_graph.shape}")
 print(f"Label distribution in graph: {np.unique(y_graph.numpy(), return_counts=True)}")
 
-# Create train/test masks based on original split
-# Train mask: nodes from SMOTE-balanced training set
-train_node_ids = set(X_train_modeling.index)
-test_node_ids = set(X_test_modeling.index)
+# Create train/test masks based on temporal split and labeled data
+train_node_ids = set(train_temporal_df.index)
+test_node_ids = set(test_temporal_df.index)
 
 # Create masks and exclude unlabeled nodes (label=-1)
 labeled_mask = y_graph >= 0  # Only nodes with valid labels (0 or 1)
@@ -2607,61 +2587,60 @@ print("=" * 80)
 
 start_time = time.time()
 
-for epoch in range(num_epochs):
-    epoch_start = time.time()
+with tqdm(total=num_epochs, desc="GraphSAGE Training", unit="epoch", colour="green") as epoch_pbar:
+    for epoch in range(num_epochs):
+        epoch_start = time.time()
 
-    # Training
-    gnn_model.train()
-    optimizer.zero_grad()
+        # Training
+        gnn_model.train()
+        optimizer.zero_grad()
 
-    # Forward pass on entire graph
-    out = gnn_model(graph_data.x, graph_data.edge_index)
-
-    # Loss only on training nodes
-    loss = criterion(out[train_mask], graph_data.y[train_mask])
-
-    # Backward pass
-    loss.backward()
-    optimizer.step()
-
-    train_loss = loss.item()
-    train_losses.append(train_loss)
-
-    # Validation
-    gnn_model.eval()
-    with torch.no_grad():
+        # Forward pass on entire graph
         out = gnn_model(graph_data.x, graph_data.edge_index)
-        val_loss = criterion(out[test_mask], graph_data.y[test_mask]).item()
-        val_losses.append(val_loss)
 
-        # Calculate accuracy
-        pred = out.argmax(dim=1)
-        train_acc = (pred[train_mask] == graph_data.y[train_mask]).sum().item() / train_mask.sum().item()
-        val_acc = (pred[test_mask] == graph_data.y[test_mask]).sum().item() / test_mask.sum().item()
+        # Loss only on training nodes
+        loss = criterion(out[train_mask], graph_data.y[train_mask])
 
-    # Epoch summary
-    epoch_time = time.time() - epoch_start
-    total_time = time.time() - start_time
+        # Backward pass
+        loss.backward()
+        optimizer.step()
 
-    print(f"Epoch [{epoch+1}/{num_epochs}] - {epoch_time:.1f}s")
-    print(f"  Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f}")
-    print(f"  Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-    print(f"  Total elapsed: {total_time/60:.1f} min")
+        train_loss = loss.item()
+        train_losses.append(train_loss)
 
-    # Early stopping
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        patience_counter = 0
-        torch.save(gnn_model.state_dict(), DLConfig.GNN_MODEL_PATH)
-        print(f"  Model saved (val_loss improved)")
-    else:
-        patience_counter += 1
-        print(f"  No improvement (patience: {patience_counter}/{patience})")
-        if patience_counter >= patience:
-            print(f"\nEarly stopping at epoch {epoch+1}")
-            break
+        # Validation
+        gnn_model.eval()
+        with torch.no_grad():
+            out = gnn_model(graph_data.x, graph_data.edge_index)
+            val_loss = criterion(out[test_mask], graph_data.y[test_mask]).item()
+            val_losses.append(val_loss)
 
-    print("-" * 80)
+            # Calculate accuracy
+            pred = out.argmax(dim=1)
+            train_acc = (pred[train_mask] == graph_data.y[train_mask]).sum().item() / train_mask.sum().item()
+            val_acc = (pred[test_mask] == graph_data.y[test_mask]).sum().item() / test_mask.sum().item()
+
+        # Epoch summary
+        epoch_time = time.time() - epoch_start
+        total_time = time.time() - start_time
+
+        # Update progress bar with metrics
+        epoch_pbar.update(1)
+        epoch_pbar.set_postfix({
+            "train_loss": f"{train_loss:.4f}",
+            "val_loss": f"{val_loss:.4f}",
+            "val_acc": f"{val_acc:.4f}"
+        })
+
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(gnn_model.state_dict(), DLConfig.GNN_MODEL_PATH)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
 
 # Training complete
 training_time = time.time() - start_time
@@ -2922,11 +2901,11 @@ print("=" * 80)
 # We already have node_to_idx and idx_to_node from GNN data prep
 
 # For training: use SMOTE-balanced training data
-train_node_ids_list = X_train_modeling.index.tolist()
+train_node_ids_list = train_temporal_df.index.tolist()
 train_node_indices = torch.tensor([node_to_idx[nid] for nid in train_node_ids_list], dtype=torch.long)
 
-# For testing: use original test data
-test_node_ids_list = X_test_modeling.index.tolist()
+# For testing: use original labeled test data
+test_node_ids_list = test_temporal_df.index.tolist()
 test_node_indices = torch.tensor([node_to_idx[nid] for nid in test_node_ids_list], dtype=torch.long)
 
 print(f"\nData alignment:")
@@ -3009,101 +2988,101 @@ start_time = time.time()
 num_train_samples = len(X_train_tensor)
 num_batches = (num_train_samples + batch_size - 1) // batch_size
 
-for epoch in range(num_epochs):
-    hybrid_model.train()
-    train_loss = 0.0
-    epoch_start = time.time()
+with tqdm(total=num_epochs, desc="Hybrid Training", unit="epoch", colour="red") as epoch_pbar:
+    for epoch in range(num_epochs):
+        hybrid_model.train()
+        train_loss = 0.0
+        epoch_start = time.time()
 
-    # Shuffle indices
-    indices = torch.randperm(num_train_samples)
+        # Shuffle indices
+        indices = torch.randperm(num_train_samples)
 
-    # Training batches
-    for batch_idx in range(num_batches):
-        start_idx = batch_idx * batch_size
-        end_idx = min(start_idx + batch_size, num_train_samples)
-        batch_indices = indices[start_idx:end_idx]
+        # Training batches with progress bar
+        with tqdm(total=num_batches, desc=f"  Epoch {epoch+1}", unit="batch", leave=False, colour="magenta") as batch_pbar:
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_train_samples)
+                batch_indices = indices[start_idx:end_idx]
 
-        # Get batch data
-        batch_X_temporal = X_train_tensor[batch_indices]
-        batch_y = y_train_tensor[batch_indices]
-        batch_node_indices = train_node_indices[batch_indices]
+                # Get batch data
+                batch_X_temporal = X_train_tensor[batch_indices]
+                batch_y = y_train_tensor[batch_indices]
+                batch_node_indices = train_node_indices[batch_indices]
 
-        # Forward pass
-        optimizer.zero_grad()
-        outputs = hybrid_model(
-            batch_X_temporal,
-            graph_data.x,
-            graph_data.edge_index,
-            batch_node_indices
-        )
-        batch_y = batch_y.to(outputs.device)
-        loss = criterion(outputs, batch_y)
+                # Forward pass
+                optimizer.zero_grad()
+                outputs = hybrid_model(
+                    batch_X_temporal,
+                    graph_data.x,
+                    graph_data.edge_index,
+                    batch_node_indices
+                )
+                batch_y = batch_y.to(outputs.device)
+                loss = criterion(outputs, batch_y)
 
-        # Backward pass
-        loss.backward()
-        optimizer.step()
+                # Backward pass
+                loss.backward()
+                optimizer.step()
 
-        train_loss += loss.item()
+                train_loss += loss.item()
 
-        # Progress every 200 batches
-        if (batch_idx + 1) % 200 == 0:
-            elapsed = time.time() - start_time
-            print(f"  Epoch {epoch+1}/{num_epochs} | Batch {batch_idx+1}/{num_batches} | Loss: {loss.item():.4f} | Time: {elapsed:.0f}s")
+                # Update batch progress bar
+                batch_pbar.update(1)
+                batch_pbar.set_postfix({"loss": f"{loss.item():.4f}"})
 
-    train_loss /= num_batches
-    train_losses.append(train_loss)
+        train_loss /= num_batches
+        train_losses.append(train_loss)
 
-    # Validation
-    hybrid_model.eval()
-    val_loss = 0.0
-    num_val_samples = len(X_test_tensor)
-    num_val_batches = (num_val_samples + batch_size - 1) // batch_size
+        # Validation
+        hybrid_model.eval()
+        val_loss = 0.0
+        num_val_samples = len(X_test_tensor)
+        num_val_batches = (num_val_samples + batch_size - 1) // batch_size
 
-    with torch.no_grad():
-        for batch_idx in range(num_val_batches):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, num_val_samples)
+        with torch.no_grad():
+            for batch_idx in range(num_val_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_val_samples)
 
-            batch_X_temporal = X_test_tensor[start_idx:end_idx]
-            batch_y = y_test_tensor[start_idx:end_idx]
-            batch_node_indices = test_node_indices[start_idx:end_idx]
+                batch_X_temporal = X_test_tensor[start_idx:end_idx]
+                batch_y = y_test_tensor[start_idx:end_idx]
+                batch_node_indices = test_node_indices[start_idx:end_idx]
 
-            outputs = hybrid_model(
-                batch_X_temporal,
-                graph_data.x,
-                graph_data.edge_index,
-                batch_node_indices
-            )
-            batch_y = batch_y.to(outputs.device)
-            loss = criterion(outputs, batch_y)
-            val_loss += loss.item()
+                outputs = hybrid_model(
+                    batch_X_temporal,
+                    graph_data.x,
+                    graph_data.edge_index,
+                    batch_node_indices
+                )
+                batch_y = batch_y.to(outputs.device)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
 
-    val_loss /= num_val_batches
-    val_losses.append(val_loss)
+        val_loss /= num_val_batches
+        val_losses.append(val_loss)
 
-    scheduler.step(val_loss)
+        scheduler.step(val_loss)
 
-    # Epoch summary
-    epoch_time = time.time() - epoch_start
-    total_time = time.time() - start_time
-    print(f"\nEpoch [{epoch+1}/{num_epochs}] - {epoch_time:.1f}s")
-    print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
-    print(f"  Total elapsed: {total_time/60:.1f} min")
+        # Epoch summary
+        epoch_time = time.time() - epoch_start
+        total_time = time.time() - start_time
+        
+        # Update epoch progress bar with metrics
+        epoch_pbar.update(1)
+        epoch_pbar.set_postfix({
+            "train_loss": f"{train_loss:.4f}",
+            "val_loss": f"{val_loss:.4f}"
+        })
 
-    # Early stopping
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        patience_counter = 0
-        torch.save(hybrid_model.state_dict(), DLConfig.HYBRID_MODEL_PATH)
-        print(f"  Model saved (val_loss improved)")
-    else:
-        patience_counter += 1
-        print(f"  No improvement (patience: {patience_counter}/{patience})")
-        if patience_counter >= patience:
-            print(f"\nEarly stopping at epoch {epoch+1}")
-            break
-
-    print("-" * 80)
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(hybrid_model.state_dict(), DLConfig.HYBRID_MODEL_PATH)
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                break
 
 # Training complete
 training_time = time.time() - start_time
@@ -3348,11 +3327,14 @@ for model_name, results in models_results.items():
     y_pred = results['y_pred']
     y_prob = results['y_prob']
 
-    # Handle different test sets (GNN uses y_test_gnn)
+    # Handle different test sets
     if model_name == 'GraphSAGE':
         y_true = y_test_gnn
+    elif model_name in ['LSTM', 'Hybrid (DL)']:
+        y_true = y_test_lstm
     else:
-        y_true = y_test_modeling
+        # Baseline ML models evaluated on labeled test subset only
+        y_true = y_test_labeled_numeric
 
     metrics = {
         'Model': model_name,
@@ -3400,7 +3382,13 @@ gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
 ax1 = fig.add_subplot(gs[0, :2])
 for model_name, results in models_results.items():
     y_prob = results['y_prob']
-    y_true = y_test_gnn if model_name == 'GraphSAGE' else y_test_modeling
+    # Use the same label sets as in the metrics block to ensure binary labels
+    if model_name == 'GraphSAGE':
+        y_true = y_test_gnn
+    elif model_name in ['LSTM', 'Hybrid (DL)']:
+        y_true = y_test_lstm
+    else:
+        y_true = y_test_labeled_numeric
     fpr, tpr, _ = roc_curve(y_true, y_prob)
     auc = roc_auc_score(y_true, y_prob)
 
@@ -3422,7 +3410,12 @@ ax1.grid(alpha=0.3)
 ax2 = fig.add_subplot(gs[1, :2])
 for model_name, results in models_results.items():
     y_prob = results['y_prob']
-    y_true = y_test_gnn if model_name == 'GraphSAGE' else y_test_modeling
+    if model_name == 'GraphSAGE':
+        y_true = y_test_gnn
+    elif model_name in ['LSTM', 'Hybrid (DL)']:
+        y_true = y_test_lstm
+    else:
+        y_true = y_test_labeled_numeric
     precision, recall, _ = precision_recall_curve(y_true, y_prob)
     ap = average_precision_score(y_true, y_prob)
 
@@ -3752,6 +3745,83 @@ else:
 # - Comprehensive evaluation across 7 models
 # - Metrics: AUC-ROC, AUC-PR, Precision, Recall, F1, MCC
 # - Visualization: ROC curves, PR curves, confusion matrices
+
+# ============================================================================
+# COMPREHENSIVE 7-MODEL COMPARISON (FINAL RESULTS)
+# ============================================================================
+# This section creates a unified comparison table for all 7 models:
+# ML Models: Logistic Regression, Random Forest, XGBoost, Ensemble (ML)
+# DL Models: LSTM, GraphSAGE, Hybrid
+
+if __name__ == '__main__':
+    # Ensure all model results are available
+    try:
+        print("\n" + "=" * 100)
+        print("FINAL COMPREHENSIVE MODEL COMPARISON (7 MODELS)")
+        print("=" * 100)
+        
+        # Verify all models have been trained and results stored
+        all_models_data = {}
+        
+        # ML Models (already trained and stored in ml_models_results)
+        for model_name, results in ml_models_results.items():
+            all_models_data[model_name] = results
+        
+        # Deep Learning Models (trained after ensemble)
+        # These will be populated after LSTM, GNN, Hybrid training
+        # For now, show which are available
+        
+        available_models = list(all_models_data.keys())
+        print(f"\n✓ Available ML Models: {', '.join(available_models)}")
+        print(f"  Pending DL Models: LSTM, GraphSAGE, Hybrid")
+        print(f"  (Will be added after deep learning training)")
+        
+        # Create comparison table for available models
+        comparison_results = []
+        
+        for model_name, results in all_models_data.items():
+            y_pred = results['y_pred']
+            y_proba = results['y_proba']
+            
+            # Calculate metrics using labeled test set
+            auc_roc = roc_auc_score(y_test_labeled_numeric, y_proba)
+            auc_pr = average_precision_score(y_test_labeled_numeric, y_proba)
+            prec = precision_score(y_test_labeled_numeric, y_pred)
+            rec = recall_score(y_test_labeled_numeric, y_pred)
+            f1 = f1_score(y_test_labeled_numeric, y_pred)
+            mcc = matthews_corrcoef(y_test_labeled_numeric, y_pred)
+            
+            comparison_results.append({
+                'Model': model_name,
+                'AUC-ROC': auc_roc,
+                'AUC-PR': auc_pr,
+                'Precision': prec,
+                'Recall': rec,
+                'F1-Score': f1,
+                'MCC': mcc
+            })
+        
+        # Create comparison DataFrame
+        comparison_final_df = pd.DataFrame(comparison_results)
+        comparison_final_df = comparison_final_df.sort_values('AUC-ROC', ascending=False).reset_index(drop=True)
+        
+        print("\n" + "=" * 100)
+        print("ML MODELS PERFORMANCE TABLE")
+        print("=" * 100)
+        print(comparison_final_df.to_string(index=False, float_format=lambda x: f'{x:.4f}'))
+        
+        best_ml_model = comparison_final_df.iloc[0]['Model']
+        best_ml_auc = comparison_final_df.iloc[0]['AUC-ROC']
+        
+        print(f"\n✓ Best ML Model: {best_ml_model}")
+        print(f"✓ Best AUC-ROC: {best_ml_auc:.4f}")
+        print(f"✓ Test Set Size: {len(y_test_labeled):,} labeled transactions")
+        
+    except Exception as e:
+        print(f"\nNote: Final comparison will be completed after deep learning training")
+        print(f"Error details: {str(e)}")
+
+
 # 
 # **6. Interpretability Analysis**
 # - SHAP analysis for XGBoost and Hybrid models
