@@ -73,7 +73,7 @@ sns.set_palette("husl")
 
 # Load the datasets
 # Note: Update these paths to match your dataset location
-DATA_DIR = './dataset/rawData/elliptic_bitcoin_dataset'
+DATA_DIR = './dataset/rawData/elliptic_bitcoin_dataset' 
 
 with tqdm(total=3, desc="Loading CSV files", unit="file") as pbar:
     elliptic_txs_classes = pd.read_csv(f'{DATA_DIR}/elliptic_txs_classes.csv')
@@ -519,8 +519,14 @@ print("TEMPORAL FEATURE ENGINEERING")
 
 with tqdm(total=4, desc="Creating temporal features", unit="feature_group") as pbar:
     # Basic temporal features
+    
     data['time_step_normalized'] = (data['time_step'] - data['time_step'].min()) / \
-                                   (data['time_step'].max() - data['time_step'].min())
+                               (data['time_step'].max() - data['time_step'].min())
+
+  
+    data['time_sin'] = np.sin(2 * np.pi * data['time_step'] / 49.0)
+    data['time_cos'] = np.cos(2 * np.pi * data['time_step'] / 49.0)
+    
     data['time_period_early'] = (data['time_step'] <= 16).astype(int)
     data['time_period_mid'] = ((data['time_step'] > 16) & (data['time_step'] <= 33)).astype(int)
     data['time_period_late'] = (data['time_step'] > 33).astype(int)
@@ -1660,7 +1666,7 @@ class DLConfig:
     # ========================================================================
     # Explainability
     # ========================================================================
-    USE_SHAP = True               # Enable SHAP explanations
+    USE_SHAP = False               # Enable SHAP explanations
     SHAP_SAMPLES = 100            # Number of samples for SHAP analysis
 
 # Display current configuration
@@ -2260,10 +2266,15 @@ for col in gnn_features:
     if col not in node_feature_df.columns:
         node_feature_df[col] = 0
 
-all_nodes_df = node_feature_df[gnn_features].fillna(0)
+time_cols = ['time_sin', 'time_cos']
+
+gnn_features_final = original_features + gnn_features + time_cols 
+
+all_nodes_df = node_feature_df[gnn_features_final].fillna(0)
+
 all_labels = node_feature_df['class_label']
 
-print(f"GNN features: {len(gnn_features)} ({len(original_features)} original + {len(graph_features)} graph)")
+print(f"GNN features: {len(gnn_features_final)} (Original + Graph + Time Encoding)")
 
 print(f"\nTotal nodes with features: {len(all_nodes_df):,}")
 print(f"Feature dimension: {all_nodes_df.shape[1]}")
@@ -2769,40 +2780,37 @@ print("=" * 80)
 print("DEFINING HYBRID TEMPORAL-GRAPH ARCHITECTURE")
 print("=" * 80)
 
+
 class HybridFraudDetector(nn.Module):
     """
-    Hybrid model combining LSTM (temporal) and GraphSAGE (structural) features.
-
-    Architecture:
-    - Pre-trained LSTM model for temporal feature extraction
-    - Pre-trained GraphSAGE model for graph structural features
-    - Fusion layer combining both embeddings
-    - Final classifier for fraud detection
+    Residual Graph Hybrid Model.
+    Replaces LSTM (useless for single transactions) with a Skip-Connection 
+    that preserves raw feature signals while adding Graph Context.
     """
-    def __init__(self, lstm_model, gnn_model, fusion_dim=None, dropout=None):
+    def __init__(self, gnn_model, input_feature_dim, fusion_dim=128, dropout=0.3):
         super(HybridFraudDetector, self).__init__()
 
-        # Use config if parameters not provided
-        if fusion_dim is None:
-            fusion_dim = DLConfig.HYBRID_FUSION_DIM
-        if dropout is None:
-            dropout = DLConfig.HYBRID_DROPOUT
-
-        # Pre-trained models (freeze or fine-tune)
-        self.lstm = lstm_model
+        # 1. Pre-trained GNN (Context Extractor)
         self.gnn = gnn_model
-
-        # Calculate embedding dimensions
-        # LSTM: hidden_dim from last hidden state
-        # GNN: hidden_dim from last graph conv layer
-        lstm_emb_dim = DLConfig.LSTM_HIDDEN_DIM
-        gnn_emb_dim = DLConfig.GNN_HIDDEN_DIM
-
-        combined_dim = lstm_emb_dim + gnn_emb_dim
-
-        # Fusion layers
+        
+        # 2. Raw Feature Projector (The "XGBoost" equivalent component)
+        # Processes local features (fees, amounts) directly
+        self.raw_proj = nn.Sequential(
+            nn.Linear(input_feature_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # 3. Fusion Layer with Skip Connection
+        # Concatenates: [GNN Context] + [Projected Local] + [Original Raw]
+        # DLConfig.GNN_HIDDEN_DIM is usually 128
+        gnn_dim = 128 
+        combined_dim = gnn_dim + 64 + input_feature_dim
+        
         self.fusion = nn.Sequential(
             nn.Linear(combined_dim, fusion_dim),
+            nn.BatchNorm1d(fusion_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(fusion_dim, fusion_dim // 2),
@@ -2810,57 +2818,36 @@ class HybridFraudDetector(nn.Module):
             nn.Dropout(dropout)
         )
 
-        # Final classifier
+        # 4. Final Classifier
         self.classifier = nn.Linear(fusion_dim // 2, 2)
 
-        self.fusion_dim = fusion_dim
-        self.dropout = dropout
-
-    def get_lstm_embedding(self, x_temporal):
-        """Extract LSTM embeddings."""
-        self.lstm.eval()
-        with torch.no_grad():
-            # Move x_temporal to the same device as LSTM parameters
-            x = x_temporal.to(self.lstm.lstm.weight_ih_l0.device).unsqueeze(1)  # (batch, 1, features)
-            lstm_out, (hidden, cell) = self.lstm.lstm(x)
-            last_hidden = hidden[-1]  # (batch, hidden_dim)
-        return last_hidden
-
-    def get_gnn_embedding(self, x_graph, edge_index):
-        """Extract GNN embeddings."""
-        self.gnn.eval()
-        with torch.no_grad():
-            gnn_emb = self.gnn.get_embedding(x_graph, edge_index)
-        return gnn_emb
-
-    def forward(self, x_temporal, x_graph, edge_index, node_indices):
+    def forward(self, x_all, edge_index, node_indices):
         """
-        Forward pass combining temporal and graph features.
-
-        Args:
-            x_temporal: Temporal features for batch (batch_size, num_features)
-            x_graph: All graph node features (num_nodes, num_features)
-            edge_index: Graph edge indices (2, num_edges)
-            node_indices: Indices to select relevant nodes from GNN output (batch_size,)
+        x_all: Features for ALL nodes in graph (for GNN context)
+        edge_index: Graph edges
+        node_indices: The specific nodes we are classifying in this batch
         """
-        # Get LSTM embeddings
-        lstm_emb = self.get_lstm_embedding(x_temporal)  # (batch_size, lstm_hidden_dim)
-
-        # Get GNN embeddings for entire graph, then select relevant nodes
-        gnn_emb_all = self.get_gnn_embedding(x_graph, edge_index)  # (num_nodes, gnn_hidden_dim)
-        gnn_emb = gnn_emb_all[node_indices]  # (batch_size, gnn_hidden_dim)
-
-        # Concatenate embeddings
-        combined = torch.cat([lstm_emb, gnn_emb], dim=1)  # (batch_size, combined_dim)
-
-        # Fusion and classification
+        # 1. Get Graph Context (Embeddings for specific nodes)
+        # We use the GNN to look at neighbors
+        gnn_emb_all = self.gnn.get_embedding(x_all, edge_index)
+        batch_gnn_emb = gnn_emb_all[node_indices]
+        
+        # 2. Get Local Signal
+        batch_raw = x_all[node_indices]
+        local_emb = self.raw_proj(batch_raw)
+        
+        # 3. Residual Concatenation (The "Expert" Trick)
+        # We feed the raw features directly into the fusion layer too
+        # This ensures the model never performs WORSE than a basic MLP
+        combined = torch.cat([batch_gnn_emb, local_emb, batch_raw], dim=1)
+        
+        # 4. Classify
         fused = self.fusion(combined)
         output = self.classifier(fused)
-
+        
         return output
 
-# Initialize hybrid model with pre-trained components
-hybrid_model = HybridFraudDetector(lstm_model, gnn_model).to(cpu_device)
+hybrid_model = HybridFraudDetector(gnn_model, input_feature_dim=graph_data.num_node_features).to(device)
 
 # Count parameters
 total_params = sum(p.numel() for p in hybrid_model.parameters())
@@ -2903,6 +2890,28 @@ print("=" * 80)
 # For training: use SMOTE-balanced training data
 train_node_ids_list = train_temporal_df.index.tolist()
 train_node_indices = torch.tensor([node_to_idx[nid] for nid in train_node_ids_list], dtype=torch.long)
+
+# Get labels for the training nodes
+train_labels_real = graph_data.y[train_node_indices].cpu().numpy()
+
+# Calculate weights: Inverse frequency
+class_counts = np.bincount(train_labels_real)
+# Prevent divide by zero if any class is missing (unlikely but safe)
+class_weights_sampling = 1. / np.maximum(class_counts, 1)
+samples_weights = class_weights_sampling[train_labels_real]
+sampler = torch.utils.data.WeightedRandomSampler(
+    weights=torch.from_numpy(samples_weights).double(),
+    num_samples=len(samples_weights),
+    replacement=True
+)
+# Note: shuffle=False is required when using a sampler
+train_loader_hybrid = DataLoader(
+    TensorDataset(train_node_indices), # We only need indices, the model looks up features in the Graph
+    batch_size=batch_size,
+    sampler=sampler, # <--- HERE IS THE MAGIC
+    num_workers=0
+)
+
 
 # For testing: use original labeled test data
 test_node_ids_list = test_temporal_df.index.tolist()
@@ -2947,22 +2956,35 @@ class_weights_hybrid = compute_class_weight(
     classes=np.unique(train_labels_hybrid_np),
     y=train_labels_hybrid_np
 )
-class_weights_hybrid = torch.tensor(class_weights_hybrid, dtype=torch.float32).to(cpu_device)
+
+
+graph_data = graph_data.to(device)
+class_weights_hybrid = torch.tensor(class_weights_hybrid, dtype=torch.float32).to(device)
+
 print(f"\nHybrid Model Class weights (to handle imbalance):")
 print(f"  Licit (class 0):   {class_weights_hybrid[0]:.3f}")
 print(f"  Illicit (class 1): {class_weights_hybrid[1]:.3f}")
 
-# CRITICAL FIX: Enable fine-tuning of pre-trained models (don't freeze them!)
-# This allows the LSTM and GNN to adapt to the hybrid learning objective
-optimizer = torch.optim.Adam([
+
+# 1. Use AdamW (Better weight decay handling)
+optimizer = torch.optim.AdamW([
     {'params': hybrid_model.fusion.parameters(), 'lr': learning_rate},
     {'params': hybrid_model.classifier.parameters(), 'lr': learning_rate},
-    {'params': lstm_model.parameters(), 'lr': learning_rate * 0.1},  # Fine-tune LSTM with lower LR
-    {'params': gnn_model.parameters(), 'lr': learning_rate * 0.1}    # Fine-tune GNN with lower LR
-], weight_decay=DLConfig.WEIGHT_DECAY)
+    {'params': hybrid_model.raw_proj.parameters(), 'lr': learning_rate}, # Don't forget the new projection layer
+    {'params': gnn_model.parameters(), 'lr': learning_rate * 0.5}    # Fine-tune GNN slowly
+], weight_decay=1e-4)
 
-criterion = nn.CrossEntropyLoss(weight=class_weights_hybrid)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+# Increase gamma to 3.0 to focus on "hard" examples
+# Use the class weights you calculated earlier
+criterion = FocalLoss(alpha=0.25, gamma=2.0, weight=None)
+
+# 3. OneCycle Scheduler (Converges faster and better)
+scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    optimizer, 
+    max_lr=learning_rate, 
+    steps_per_epoch=len(train_loader_hybrid), 
+    epochs=num_epochs
+)
 
 print(f"\nTraining configuration:")
 print(f"  Device: {cpu_device}")
@@ -2999,24 +3021,21 @@ with tqdm(total=num_epochs, desc="Hybrid Training", unit="epoch", colour="red") 
 
         # Training batches with progress bar
         with tqdm(total=num_batches, desc=f"  Epoch {epoch+1}", unit="batch", leave=False, colour="magenta") as batch_pbar:
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, num_train_samples)
-                batch_indices = indices[start_idx:end_idx]
+            for batch_idx, (batch_indices) in enumerate(tqdm(train_loader_hybrid)):
+                
+                batch_indices = batch_indices[0].to(device) 
+                
+                # Get labels directly from the Graph data (aligned)
+                batch_y = graph_data.y[batch_indices]
 
-                # Get batch data
-                batch_X_temporal = X_train_tensor[batch_indices]
-                batch_y = y_train_tensor[batch_indices]
-                batch_node_indices = train_node_indices[batch_indices]
-
-                # Forward pass
+                # Forward pass (Only 3 arguments now)
                 optimizer.zero_grad()
                 outputs = hybrid_model(
-                    batch_X_temporal,
-                    graph_data.x,
-                    graph_data.edge_index,
-                    batch_node_indices
+                    graph_data.x,           # x_all
+                    graph_data.edge_index,  # edge_index
+                    batch_indices           # node_indices
                 )
+              
                 batch_y = batch_y.to(outputs.device)
                 loss = criterion(outputs, batch_y)
 
@@ -3044,16 +3063,18 @@ with tqdm(total=num_epochs, desc="Hybrid Training", unit="epoch", colour="red") 
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_val_samples)
 
-                batch_X_temporal = X_test_tensor[start_idx:end_idx]
-                batch_y = y_test_tensor[start_idx:end_idx]
-                batch_node_indices = test_node_indices[start_idx:end_idx]
+                
+                batch_node_indices = test_node_indices[start_idx:end_idx].to(device)
+                
+                # Get labels from graph data to ensure alignment
+                batch_y = graph_data.y[batch_node_indices]
 
                 outputs = hybrid_model(
-                    batch_X_temporal,
-                    graph_data.x,
-                    graph_data.edge_index,
-                    batch_node_indices
+                    graph_data.x,           # x_all
+                    graph_data.edge_index,  # edge_index
+                    batch_node_indices      # node_indices
                 )
+                
                 batch_y = batch_y.to(outputs.device)
                 loss = criterion(outputs, batch_y)
                 val_loss += loss.item()
@@ -3119,14 +3140,12 @@ with torch.no_grad():
         start_idx = batch_idx * batch_size
         end_idx = min(start_idx + batch_size, num_test_samples)
 
-        batch_X_temporal = X_test_tensor[start_idx:end_idx]
-        batch_node_indices = test_node_indices[start_idx:end_idx]
+        batch_node_indices = test_node_indices[start_idx:end_idx].to(device)
 
         outputs = hybrid_model(
-            batch_X_temporal,
-            graph_data.x,
-            graph_data.edge_index,
-            batch_node_indices
+            graph_data.x,           # x_all
+            graph_data.edge_index,  # edge_index
+            batch_node_indices      # node_indices
         )
 
         probs = F.softmax(outputs, dim=1).cpu().numpy()
