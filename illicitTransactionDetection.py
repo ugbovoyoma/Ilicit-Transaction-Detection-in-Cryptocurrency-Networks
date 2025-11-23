@@ -1616,7 +1616,7 @@ class DLConfig:
     # ========================================================================
     # Hybrid Model Architecture
     # ========================================================================
-    HYBRID_FUSION_DIM = 64        # Fusion layer dimension
+    HYBRID_FUSION_DIM = 256        # Fusion layer dimension
     HYBRID_DROPOUT = 0.3          # Dropout rate for hybrid fusion layers
     HYBRID_CONCAT_METHOD = 'concatenate'  # 'concatenate', 'add', 'multiply'
 
@@ -1624,7 +1624,7 @@ class DLConfig:
     # Training Hyperparameters
     # ========================================================================
     BATCH_SIZE = 256              # Batch size (128, 256, 512, 1024)
-    NUM_EPOCHS = 15               # Maximum epochs (10, 15, 20, 50)
+    NUM_EPOCHS = 30               # Maximum epochs (10, 15, 20, 50)
     LEARNING_RATE = 0.001         # Learning rate (0.0001, 0.001, 0.01)
     WEIGHT_DECAY = 1e-5           # L2 regularization
     PATIENCE = 5                  # Early stopping patience
@@ -2787,26 +2787,33 @@ class HybridFraudDetector(nn.Module):
     Replaces LSTM (useless for single transactions) with a Skip-Connection 
     that preserves raw feature signals while adding Graph Context.
     """
-    def __init__(self, gnn_model, input_feature_dim, fusion_dim=128, dropout=0.3):
+    def __init__(self, gnn_model, input_feature_dim, fusion_dim=256, dropout=0.3):
         super(HybridFraudDetector, self).__init__()
 
         # 1. Pre-trained GNN (Context Extractor)
         self.gnn = gnn_model
         
-        # 2. Raw Feature Projector (The "XGBoost" equivalent component)
-        # Processes local features (fees, amounts) directly
+        # 2. Raw Feature Projector (UPGRADE: Deeper MLP)
+        # Instead of compressing immediately, we expand/maintain first.
+        # This allows the model to learn complex interactions from raw features.
         self.raw_proj = nn.Sequential(
-            nn.Linear(input_feature_dim, 64),
-            nn.BatchNorm1d(64),
+            nn.Linear(input_feature_dim, 256), # Expand to capture details
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(256, 128), # Compress slightly
+            nn.BatchNorm1d(128),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
-        # 3. Fusion Layer with Skip Connection
-        # Concatenates: [GNN Context] + [Projected Local] + [Original Raw]
-        # DLConfig.GNN_HIDDEN_DIM is usually 128
+        # 3. Fusion Layer
+        # Concatenates: [GNN Context (128)] + [Projected Local (128)] + [Original Raw (~175)]
         gnn_dim = 128 
-        combined_dim = gnn_dim + 64 + input_feature_dim
+        raw_proj_output_dim = 128
+        
+        # Calculate exact combined dimension
+        combined_dim = gnn_dim + raw_proj_output_dim + input_feature_dim
         
         self.fusion = nn.Sequential(
             nn.Linear(combined_dim, fusion_dim),
@@ -3387,7 +3394,54 @@ print(f"Best AUC-ROC Score: {best_auc:.4f}")
 comparison_df.to_csv('model_comparison_results.csv', index=False)
 print("\nComparison table saved as 'model_comparison_results.csv'")
 
+# ... (existing code above) ...
+print("\nComparison table saved as 'model_comparison_results.csv'")
 
+
+print("\n" + "=" * 80)
+print("CALCULATING GRAND ENSEMBLE (HYBRID + XGBOOST)")
+print("=" * 80)
+
+# Get probabilities from your two best models
+# Note: Ensure 'models_results' is the dictionary populated in the previous step
+y_prob_xgb = models_results['XGBoost']['y_prob']
+y_prob_hybrid = models_results['Hybrid (DL)']['y_prob']
+
+# Weights: Give slightly more trust to XGBoost (higher precision) but use Hybrid for context
+# A 60/40 split is a good starting point based on their AUCs
+w_xgb = 0.6
+w_hybrid = 0.4
+
+# Combine
+y_prob_grand = (w_xgb * y_prob_xgb) + (w_hybrid * y_prob_hybrid)
+y_pred_grand = (y_prob_grand >= 0.5).astype(int)
+
+# Evaluate
+# y_test_labeled_numeric is defined earlier in the script (during baseline evaluation)
+# If it's not available in this scope, recreate it:
+if 'y_test_labeled_numeric' not in locals():
+     y_test_labeled_numeric = y_test_labeled.map({'1': 1, '2': 0})
+
+y_test_numeric = y_test_labeled_numeric 
+
+auc_grand = roc_auc_score(y_test_numeric, y_prob_grand)
+rec_grand = recall_score(y_test_numeric, y_pred_grand)
+prec_grand = precision_score(y_test_numeric, y_pred_grand)
+f1_grand = f1_score(y_test_numeric, y_pred_grand)
+
+print(f"Grand Ensemble Performance:")
+print(f"  AUC-ROC:   {auc_grand:.4f}")
+print(f"  F1-Score:  {f1_grand:.4f}")
+print(f"  Precision: {prec_grand:.4f}")
+print(f"  Recall:    {rec_grand:.4f}")
+
+if auc_grand > 0.9406:
+    print("\n🏆 SUCCESS: Grand Ensemble beats all individual baselines!")
+else:
+    print("\nResult is strong, but individual XGBoost remains dominant.")
+
+
+# COMPREHENSIVE VISUALIZATION - ALL MODELS
 # In[ ]:
 
 
