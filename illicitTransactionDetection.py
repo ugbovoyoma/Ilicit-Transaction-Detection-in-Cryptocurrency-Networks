@@ -1050,6 +1050,18 @@ with tqdm(total=4, desc="Visualization", unit="plot", colour="cyan") as pbar:
 
     # Prepare data for bar chart
     models = ['LR', 'RF', 'XGB', 'Ensemble']
+    
+    # Helper to extract metrics from the stored results dictionary
+    def get_metrics(name):
+        y_p = ml_models_results[name]['y_pred']
+        y_t = y_test_labeled_numeric 
+        return precision_score(y_t, y_p), recall_score(y_t, y_p), f1_score(y_t, y_p)
+
+    # Define the variables that were missing
+    prec_lr, rec_lr, f1_lr = get_metrics('Logistic Regression')
+    prec_rf, rec_rf, f1_rf = get_metrics('Random Forest')
+    prec_xgb, rec_xgb, f1_xgb = get_metrics('XGBoost')
+    prec_ens, rec_ens, f1_ens = get_metrics('Ensemble (ML)')
     metrics_data = {
         'Precision': [prec_lr, prec_rf, prec_xgb, prec_ens],
         'Recall': [rec_lr, rec_rf, rec_xgb, rec_ens],
@@ -1199,20 +1211,9 @@ np.random.seed(seed)
 print("\nDeep learning environment configured successfully")
 
 
-# **MODEL 1: LSTM TEMPORAL FRAUD DETECTION**
-# 
-# Implements bidirectional LSTM to capture temporal patterns across 49 time steps. This model processes transaction sequences to identify fraud campaign evolution patterns.
-
-# In[ ]:
-
+# MODEL 1: LSTM TEMPORAL FRAUD DETECTION
 
 # PREPARE TEMPORAL SEQUENCE DATA FOR LSTM
-print("=" * 80)
-print("PREPARING TEMPORAL SEQUENCE DATA FOR LSTM")
-print("=" * 80)
-
-# Prepare training sequences using ONLY real labeled nodes in the training window (time_step ≤ 35)
-print("Converting training data to PyTorch tensors...")
 
 train_temporal_df = data[(data['time_step'] <= 35) & (data['class_label'].isin(['1', '2']))].set_index('node_ID')
 test_temporal_df = data[(data['time_step'] > 35) & (data['class_label'].isin(['1', '2']))].set_index('node_ID')
@@ -1239,7 +1240,6 @@ unique, counts = np.unique(y_train_np, return_counts=True)
 print(f"Training class distribution: {dict(zip(unique, counts))}")
 
 # Prepare test sequences
-print("\nConverting test data to PyTorch tensors...")
 # Use LSTM features for test data
 print(f"LSTM test features: {len(lstm_features)}")
 X_test_np = test_temporal_df[lstm_features].values.astype(np.float32)
@@ -1289,9 +1289,7 @@ print("\nTemporal sequence data preparation completed")
 
 # SIMPLIFIED LSTM MODEL ARCHITECTURE (NO ATTENTION - FASTER)
 
-print("=" * 80)
 print("BUILDING SIMPLIFIED LSTM TEMPORAL MODEL")
-print("=" * 80)
 
 
 # Focal Loss implementation for deep models
