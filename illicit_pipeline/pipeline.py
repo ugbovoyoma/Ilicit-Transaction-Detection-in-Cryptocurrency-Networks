@@ -1,8 +1,6 @@
 """
 Top-level orchestration for the modular pipeline.
 
-This keeps the flow readable and makes it easy to toggle expensive components
-such as deep learning models.
 """
 
 from __future__ import annotations
