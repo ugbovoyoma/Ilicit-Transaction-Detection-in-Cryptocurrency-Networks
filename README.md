@@ -1,14 +1,12 @@
 # Illicit Transaction Detection in Cryptocurrency Networks
 
-**A Comparative Analysis of Temporal, Graph, and Tabular Learning Architectures**
-
 This repository contains the implementation code for an MSc dissertation submitted to the University of Ibadan, February 2026.
 
 ---
 
 ## Thesis Information
 
-**Title:** Machine and Deep Learning for Illicit Transaction Detection in Cryptocurrency Networks: A Comparative Analysis of Temporal, Graph, and Tabular Learning Architectures
+**Title:** Machine, Deep and Ensemble Learning For Illicit Transaction Detection In Cryptocurrency Networks: A Comparative Analysis Of Temporal, Graph, and Tabular Learning Architectures
 
 **Author:** Ugbovo Ogheneyoma Precious  
 **Matric No.:** 246087  
@@ -23,23 +21,32 @@ This repository contains the implementation code for an MSc dissertation submitt
 
 ## Abstract
 
-Cryptocurrency networks have become an indispensable pillar of the digital economy, where decentralisation, transparency and effectiveness of transactions become a reality. However, the pseudo-anonymity of the networks has also attracted many illicit practices, such as money laundering and terror funding. Conventional rule-based systems, which are traditionally used in centralised banking, are not effective in evaluating the ever-increasing scale, temporal complexity, and graph-like nature of the transactions in blockchain. The main aim of this study is to perform a comparative analysis of temporal, graph, and tabular learning architectures so as to determine the most effective strategy for identifying illicit cryptocurrency transfers.
-The research adopted a quantitative study design that utilised the Elliptic Bitcoin transaction dataset. To deal with the intrinsic problem of imbalance classes in financial fraud data, the machine learning baselines used the Synthetic Minority Oversampling Technique, and the deep learning architectures used Focal Loss. Three different learning paradigms were systematically assessed in the research: tabular learning with the help of logistic regression, random forest, and gradient boosting; graph learning with GraphSAGE helping to capture the topological structure; and temporal learning with bi-directional long short-term memory networks helping to model transaction sequences. These models were tested individually and were then combined together to create a Grand Ensemble strategy.
-The comparison showed that tabular learning structures are still highly effective when designed with aggregated neighbourhood features. In particular, the XGBoost model showed high results on an individual level, with a precision of 94.69% and an F1-score of 78.65. Conversely, although the hybrid graph-temporal network was able to effectively capture latent structural dependencies, it had a slightly lower F1 score of 76.04%. The research established that the best solution was a combination of these strategies. The constructed Grand Ensemble that overlaid the feature sharpness of XGBoost with the structural embeddings of the hybrid network gained a higher precision of 94.70%, a recall of 67.48%, an F1-score of 78.81%, and a Matthews Correlation Coefficient of 0.7896. In addition, the model proved to have good discrimination with an area under the ROC curve of 0.9196 and an area under the precision-recall curve of 0.7591.
-This study concludes that while advanced tabular models are competitive, hybrid ensemble architectures provide the strongest defence against financial crime. It is suggested that financial intelligence departments should implement ensemble-based monitoring tools to reduce false positives while still achieving high detection rates. Also, it is suggested to integrate explainable AI tools, such as SHAP, so as to have the transparency required in regulatory compliance.
+Cryptocurrency networks have become an indispensable pillar of the digital economy, where decentralisation, transparency and effectiveness of transactions become a reality. However, the pseudo-anonymity of the networks has also attracted many illicit practices, such as moneylaundering and terror funding. Conventional rule-based systems, which are traditionally used in centralised banking, are not effective in evaluating the ever-increasing scale, temporal complexity, and graph-like nature of the transactions in blockchain. The main aim of this study is to perform a comparative analysis of temporal, graph, and tabular learning architectures to determine the most effective strategy for identifying illicit cryptocurrency transfers. The research adopted a quantitative study design that utilised the Elliptic Bitcoin transaction dataset. To deal with the intrinsic problem of imbalance classes in financial fraud data, the machine learning baselines used the Synthetic Minority Oversampling Technique, and the deep learning architectures used Focal Loss. Three different learning paradigms were systematically assessed in the research: tabular learning with the help of logistic regression, random forest, and gradient boosting; graph learning with GraphSAGE helping to capture the topological structure; and temporal learning with bi-directional long short-term memory networks helping to model transaction sequences. These models were tested individually and were then combined to create a Grand Ensemble strategy. The comparison showed that tabular learning structures are still highly effective when designed with aggregated neighbourhood features. In particular, the XGBoost model showed high results on an individual level, with a precision of 94.69% and an F1-score of 78.65%. Conversely, although the hybrid graph-temporal network was able to effectively capture latent structural dependencies, it had a slightly lower F1 score of 76.04%. The research established that the best solution was a combination of these strategies. The constructed Grand Ensemble that overlaid the feature sharpness of XGBoost with the structural embeddings of the hybrid network gained a higher precision of 94.70%, a recall of 67.48%, an F1-score of 78.81%, and a Matthews Correlation Coefficient of 0.7896. In addition, the model proved to have good discrimination with an area under the ROC curve of 0.9196 and an area under the precision-recall curve of 0.7591. This study concludes that while advanced tabular models are competitive, hybrid ensemble architectures provide the strongest defence against financial crime. It is suggested that financial intelligence departments should implement ensemble-based monitoring tools to reduce false positives while still achieving high detection rates. Also, it is suggested to integrate explainable AI tools, such as SHAP, to have the transparency required in regulatory compliance.
 
 Keywords: Cryptocurrency, Anti-Money Laundering, Graph Neural Networks, Deep Learning, Ensemble Learning
+Word Count: 409
 
 
 ---
 
 ## Research Objectives
 
-1. Systematically evaluate tabular, temporal, and graph-based learning architectures for illicit transaction detection
-2. Develop robust temporal and graph-structural features that capture fraudulent transaction patterns
-3. Implement and compare techniques (SMOTE, class weighting, focal loss) for handling severely imbalanced datasets
-4. Provide an end-to-end modular pipeline suitable for real-world cryptocurrency fraud detection systems
+The primary objective of this study is to evaluate the performance of temporal, graph-based, and tabular architectures, as well as identify the best ensemble strategy for identifying illicit cryptocurrency transactions using classification metrics.
 
+The specific objectives are:
+
+a) To determine the statistical distributions, topological forms and temporal patterns ofillicit and licit transaction processes by conducting an exploratory data analysis on the Elliptic dataset.
+
+b) To derive high-resolution and informative temporal and topological features that could effectively capture subtle patterns in the cryptocurrency transaction graph.
+
+c) To evaluate and compare the baseline performance of different traditional machine learning algorithms using standard metrics to measure the predictive strength of explicit statistical information.
+
+d) To determine the detection efficacy of deep learning Bi-Directional LSTMs and GraphSAGE by benchmarking their performance metrics against the traditional
+tabular models.
+
+e) To derive a robust hybrid ensemble architecture that integrates tabular, temporal and graph-based learners, and to mathematically measure its impact on detection stability and the reduction of false positives.
+
+f) To systematically compare the isolated architectures against the Grand Ensemble strategy to determine the optimal operational threshold that effectively balances detection recall with operational precision.
 ---
 
 ## Project Structure
